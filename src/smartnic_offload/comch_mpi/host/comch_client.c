@@ -1881,11 +1881,13 @@ static void *collective_submit_main(void *arg)
         /* profiling */
         prof_ops++;
         prof_submit_ns += (t1 - t0);
+#if 0 /* 計測ログ [HOST SUBMIT PROF] を無効化 (2026-07-27) */
         if (prof_ops % 5000 == 0) {
             double avg_us = (double)prof_submit_ns / prof_ops / 1000.0;
             printf("[HOST SUBMIT PROF] ops=%lu | avg_submit=%.1fus\n", prof_ops, avg_us);
             fflush(stdout);
         }
+#endif
 
         pthread_mutex_lock(&g_collective_q_mtx);
     }
@@ -1946,12 +1948,14 @@ static void *collective_completion_main(void *arg)
         /* profiling */
         prof_ops++;
         prof_wait_ns += (t1 - t0);
+#if 0 /* 計測ログ [HOST COMPLETION PROF] を無効化 (2026-07-27) */
         if (prof_ops % 5000 == 0) {
             double avg_us = (double)prof_wait_ns / prof_ops / 1000.0;
             printf("[HOST COMPLETION PROF] ops=%lu | avg_doorbell_wait=%.1fus\n",
                    prof_ops, avg_us);
             fflush(stdout);
         }
+#endif
     }
     return NULL;
 }

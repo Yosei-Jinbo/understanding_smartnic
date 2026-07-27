@@ -4,3 +4,7 @@ build/
 *.pyc
 __pycache__/
 *.egg-info/
+GPU_FLAG_WAIT_ANALYSIS.md
+REBUTTAL_ABLATION_PLAN.md
+logs/
+.claude/

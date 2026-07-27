@@ -139,30 +139,32 @@ struct spsc_doca_task_queue_t;
 struct spsc_completion_queue_t;
 
 /* ワーカスレッドコンテキスト */
+/* Option 2: 1 ワーカが複数 PE を round-robin progress。
+ * 1 ワーカあたり最大 = 3 役割 × 2 rail = 6 PE。 */
+#define WORKER_MAX_PE  (2 * DOCA_WORKER_TYPE_COUNT)
+
 struct doca_worker_thread_ctx {
     pthread_t              thread;
-    doca_worker_type_t     worker_type;
+    doca_worker_type_t     worker_type;   /* 互換用（未使用） */
     int                    core_id;
 
-    /* 担当する DOCA RDMA コンテキスト */
-    struct doca_rdma_ctx_t *rdma_ctx;
-    struct doca_rdma_ctx_t *rdma_ctx_rail1;  /* Multi-Rail: 2 番目 (NULL ならシングル) */
+    /* 担当する PE 群（context + spinlock を round-robin で progress） */
+    int                     n_pe;
+    struct doca_rdma_ctx_t *pe_ctx[WORKER_MAX_PE];
+    struct pe_spin_t       *pe_spins[WORKER_MAX_PE];
 
-    void                  *task_queue;        /* spsc_doca_task_queue_t* */
-    void                  *completion_queue;  /* spsc_completion_queue_t* */
+    void                  *task_queue;        /* spsc_doca_task_queue_t* (EXIT 通知のみ) */
+    void                  *completion_queue;  /* spsc_completion_queue_t* (未使用) */
 
     atomic_bool            running;
-    atomic_bool            paused;         /* inline 実行中は true */
-    atomic_bool            paused_ack;     /* pause 確認用 */
-
-    /* Phase 6 Step F: PE spinlocks for thread-safe PE progress */
-    struct pe_spin_t      *pe_spin;        /* rail0 PE spinlock */
-    struct pe_spin_t      *pe_spin_rail1;  /* rail1 PE spinlock (NULL if single rail) */
+    atomic_bool            paused;
+    atomic_bool            paused_ack;
 };
 
-/* DOCA ワーカスレッドプール */
+/* DOCA ワーカスレッドプール（N = g_comm_cores 本, 最大 DOCA_WORKER_TYPE_COUNT） */
 struct doca_worker_thread_pool_t {
     struct doca_worker_thread_ctx workers[DOCA_WORKER_TYPE_COUNT];
+    int n_workers;
     int mpi_rank;
     atomic_bool initialized;
 };

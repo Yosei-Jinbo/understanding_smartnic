@@ -1,0 +1,153 @@
+#!/bin/bash
+###############################################################################
+# sweep_ablation.sh — 票1: 最適化アブレーション（積み上げ・依存順固定）
+#
+# 目的:
+#   3 つの最適化を「依存順に積み上げ」て各段の効果を測る（OFAT ではない）。
+#     依存順: マルチコア化 → チャンクパイプライン → CrossGVMI
+#   単独 ON (OFAT) は不可（チャンクはマルチコア前提で単独では効かず誤指針になる）。
+#
+# 4 構成（各セルは DPU 側 env のみで切替。ホスト/client.py の変更は不要）:
+#   +--------------------+------------+---------------+--------------+---------------+
+#   | 構成               | COMM_CORES | COMPUTE_CORES | AG_PIECE_MAX | FORCE_STAGING |
+#   +--------------------+------------+---------------+--------------+---------------+
+#   | baseline (all off) |     1      |       1       |      1       |   1 (staging) |
+#   | + マルチコア化     |     3      |       6       |      1       |   1           |
+#   | + チャンク         |     3      |       6       |      8       |   1           |
+#   | + CrossGVMI (=full)|     3      |       6       |      8       |   0 (direct)  |
+#   +--------------------+------------+---------------+--------------+---------------+
+#   マルチコア: COMM_CORES/COMPUTE_CORES（off=1/1）。※sweep_multicore.sh と同じ env 方式。
+#   チャンク  : AG_PIECE_MAX（off=1 piece / on=8）。
+#   CrossGVMI : FORCE_STAGING（1=staging＝off / 0=GPU 直接＝on）。**AG のみ**に作用（RS は不変）。
+#
+# 計測方針:
+#   - 対象は DOCA offload の RS/AG flat のみ（BENCH_RUN=doca）。
+#   - 代表サイズ 3 点（per-rank = chunk*2 bytes）: 64KB=65536 / 1MB=1048576 / 16MB=16777216。
+#   - 取得統計: avg / p50 / p99。**主指標は p50**（RS 集約プールのコールドスタートで
+#     最初の pool 使用サイズがやや高く出る既知アーティファクトの影響を受けにくい）。
+#   - 読み筋: マルチコアは RS に効く／チャンク・CrossGVMI は大サイズ AG に効く／小サイズは効かない。
+#   - RS の CrossGVMI 行は N/A（+チャンクと同値）— RS は reduction のため staging の概念が無い。
+#   - 公平性: warmup/iters・dual_rail・コアピン・計算=rank共有/通信=rank分離 は全構成で同一。
+#     構成間で変えるのは上表の 4 env のみ。
+#
+# 前提:
+#   - 最新ソースを DPU/host に配布し、DPU 側は ./build.sh 済み（FORCE_STAGING 対応バイナリ）。
+#   - host 側 venv activate 済み。dpu_appfile は AG_PIECE_MAX/COMM_CORES/COMPUTE_CORES/FORCE_STAGING
+#     を -x で forward する版（bare）。
+#
+# 使い方:
+#   cd /home/y-jinbo/understanding_smartnic/src/smartnic_offload/comch_mpi/host
+#   source /home/y-jinbo/.venv/bin/activate
+#   bash /home/y-jinbo/understanding_smartnic/scripts/test/sweep_ablation.sh
+###############################################################################
+set -uo pipefail
+
+# ---- 設定（必要ならここだけ編集） -------------------------------------------
+HOST_DIR=/home/y-jinbo/understanding_smartnic/src/smartnic_offload/comch_mpi/host
+OUT_DIR=/home/y-jinbo/understanding_smartnic/logs/sweep_ablation
+CSV="$OUT_DIR/results.csv"
+
+BENCH_SIZES_CSV="65536,1048576,16777216"
+declare -A SIZE_LABEL=( [65536]=64KB [1048576]=1MB [16777216]=16MB )
+
+# 積み上げ構成: "name|COMM_CORES|COMPUTE_CORES|AG_PIECE_MAX|FORCE_STAGING"
+CONFIGS=(
+  "baseline|1|1|1|1"
+  "multicore|3|6|1|1"
+  "chunk|3|6|8|1"
+  "full|3|6|8|0"
+)
+
+MANUAL_DPU=1
+DPU_SSH_LAUNCHER="ssh ubuntu@dpu01"
+DPU_DIR="/home/ubuntu/doca_practice/comch_mpi/dpu"
+# -----------------------------------------------------------------------------
+
+mkdir -p "$OUT_DIR"
+echo "config,comm_cores,compute_cores,ag_piece_max,force_staging,coll,N,size_label,avg_ms,p50_ms,p99_ms" > "$CSV"
+
+restart_dpu() {
+  local name=$1 C=$2 K=$3 P=$4 S=$5
+  if [[ "$MANUAL_DPU" == "1" ]]; then
+    echo "============================================================"
+    echo "[DPU] dpu01 で以下を実行して両 DPU の collective_server を再起動 ($name):"
+    echo "  cd $DPU_DIR"
+    echo "  export COMM_CORES=$C COMPUTE_CORES=$K AG_PIECE_MAX=$P FORCE_STAGING=$S"
+    echo "  mpirun --app dpu_appfile"
+    echo "  # 起動ログに 'FORCE_STAGING=$S' 'COMM_CORES=$C COMPUTE_CORES=$K' を確認"
+    echo "------------------------------------------------------------"
+    read -r -p "DPU が待受状態になったら Enter: " _
+  else
+    $DPU_SSH_LAUNCHER "pkill -f doca_comch_server; sleep 2; cd $DPU_DIR && \
+      COMM_CORES=$C COMPUTE_CORES=$K AG_PIECE_MAX=$P FORCE_STAGING=$S \
+      nohup mpirun --app dpu_appfile > /tmp/dpu_${name}.log 2>&1 & sleep 5"
+    sleep 5
+  fi
+}
+
+run_host_bench() {
+  local log=$1
+  ( cd "$HOST_DIR" && BENCH_RUN=doca BENCH_SIZES="$BENCH_SIZES_CSV" \
+    mpirun --app host_appfile_py < /dev/null ) > "$log" 2>&1
+}
+
+# ログから [DOCA RS/AG flat] 行を抽出 → "coll,N,avg,p50,p99"
+parse_log() {
+  awk '
+    /\[DOCA (RS|AG) flat\]/ {
+      coll = ($0 ~ /DOCA RS/) ? "RS" : "AG";
+      n=$0;  sub(/.*N=[ ]*/,"",n); sub(/[^0-9].*/,"",n);
+      a=$0;  sub(/.*avg=[ ]*/,"",a); sub(/[ ]*ms.*/,"",a);
+      p=$0;  sub(/.*p50=[ ]*/,"",p); sub(/[ ]*ms.*/,"",p);
+      q=$0;  sub(/.*p99=[ ]*/,"",q); sub(/[ ]*ms.*/,"",q);
+      if (n != "") print coll","n","a","p","q;
+    }
+  ' "$1"
+}
+
+echo "[ablation] cumulative configs=${#CONFIGS[@]} sizes=$BENCH_SIZES_CSV out=$OUT_DIR"
+for cfg in "${CONFIGS[@]}"; do
+  IFS='|' read -r name C K P S <<< "$cfg"
+  log="$OUT_DIR/${name}.log"
+  echo "==== [config] $name (COMM=$C COMPUTE=$K AG_PIECE=$P FORCE_STAGING=$S) ===="
+  restart_dpu "$name" "$C" "$K" "$P" "$S"
+  echo "[host] running DOCA AG/RS flat ..."
+  run_host_bench "$log"
+  while IFS=, read -r coll n avg p50 p99; do
+    [[ -z "$n" ]] && continue
+    label="${SIZE_LABEL[$n]:-$n}"
+    echo "$name,$C,$K,$P,$S,$coll,$n,$label,$avg,$p50,$p99" >> "$CSV"
+  done < <(parse_log "$log")
+  echo "[host] done → $log"
+done
+
+echo
+echo "========== SUMMARY: p50 (ms) と baseline 比 Δ% =========="
+echo "CSV: $CSV"
+# 行=構成（積み上げ順）, 列=coll×size。各セル: p50 (Δ% vs baseline)。
+awk -F, '
+NR>1 {
+  order_seen[$1] || (order[++no]=$1, order_seen[$1]=1);
+  key=$1","$6","$8;         # config,coll,size_label
+  p50[key]=$10;
+}
+END{
+  split("AG:64KB AG:1MB AG:16MB RS:64KB RS:1MB RS:16MB", cols, " ");
+  printf "%-12s", "config";
+  for(i=1;i<=6;i++) printf "%16s", cols[i];
+  printf "\n";
+  for(r=1;r<=no;r++){
+    cfg=order[r]; printf "%-12s", cfg;
+    for(i=1;i<=6;i++){
+      split(cols[i],cc,":"); k=cfg","cc[1]","cc[2]; base="baseline","cc[1]","cc[2];
+      v=p50[k]; b=p50[base];
+      if(v==""){ printf "%16s","-"; }
+      else if(cfg=="baseline" || b=="" || b+0==0){ printf "%16.3f", v; }
+      else { d=(v-b)/b*100.0; printf "%10.3f(%+.0f%%)", v, d; }
+    }
+    printf "\n";
+  }
+  print "\n注) baseline 行は絶対値(ms)、以降は p50 と (baseline比 Δ%)。負=改善。";
+  print "    RS の full 行は chunk と同値(CrossGVMI は RS 不作用)。";
+}' "$CSV" 2>/dev/null || echo "(gawk 無し環境では summary スキップ。CSV を参照)"
+echo "========================================================"

@@ -313,96 +313,22 @@ def reduce_scatter_flat_via_base(
         return _ComchHandleWork(handle)
 
 
-def all_gather_cpu_full_flat_via_base(
-    output_flat: torch.Tensor,
-    input_flat: torch.Tensor,
-    cpu_full_flat: torch.Tensor,
-    cpu_full_flag: torch.Tensor,
-    cid: int,
-    group: Optional[dist.ProcessGroup] = None,
-    async_op: bool = False,
-):
-    comm = MPI.COMM_WORLD
-    world_size = comm.Get_size()
-
-    in_view = input_flat.view(-1)
-    out_view = output_flat.view(-1)
-    flat_view = cpu_full_flat.view(-1)
-    flag_view = cpu_full_flag.view(-1)
-
-    if out_view.numel() != in_view.numel() * world_size:
-        raise ValueError("output_flat.numel() must be input_flat.numel() * world_size")
-    if out_view.dtype != in_view.dtype:
-        raise TypeError("output_flat.dtype must match input_flat.dtype")
-
-    # ---- GPU touch ----
-    _cuda_touch_inplace(in_view, "read")
-    _cuda_touch_inplace(out_view, "write_zero")
-
-    if not async_op:
-        doca_comch_client_pybind.ucp_collective_local_cpu_request_py(
-            cid, in_view, out_view, cpu_full_flat, cpu_full_flag, CollectiveCommunication.ALL_GATHER
-        )
-        return None
-    else:
-        handle = doca_comch_client_pybind.ucp_collective_local_cpu_enqueue_py(
-            cid, in_view, out_view, cpu_full_flat, cpu_full_flag, CollectiveCommunication.ALL_GATHER
-        )
-        return _ComchHandleWork(handle)
-    
-def all_gather_cpu_full_list_via_base(
-    output_tensors: List[torch.Tensor],
-    input_tensor: torch.Tensor,
-    cpu_full_flat: torch.Tensor,
-    cpu_full_flag: torch.Tensor,
-    cid: int,
-    group: Optional[dist.ProcessGroup] = None,
-    async_op: bool = False,
-):
-    comm = MPI.COMM_WORLD
-    world_size = comm.Get_size()
-
-    flat_view = cpu_full_flat.view(-1)
-    flag_view = cpu_full_flag.view(-1)
-
-    input_flat = input_tensor.contiguous().view(-1)
-    output_flat = torch.empty(
-        world_size * input_flat.numel(),
-        dtype=input_tensor.dtype,
-        device=input_tensor.device,
-    ).contiguous()
-
-    # ---- GPU touch ----
-    _cuda_touch_inplace(output_flat, "write_zero")
-
-    if not async_op:
-        doca_comch_client_pybind.ucp_collective_local_cpu_request_py(
-            cid, input_flat, output_flat, cpu_full_flat, cpu_full_flag, CollectiveCommunication.ALL_GATHER
-        )
-        _scatter_flat_to_list(output_flat, output_tensors, input_tensor)
-        return None
-    else:
-        handle = doca_comch_client_pybind.ucp_collective_local_cpu_enqueue_py(
-            cid, input_flat, output_flat, cpu_full_flat, cpu_full_flag, CollectiveCommunication.ALL_GATHER
-        )
-        # wait() 完了時に scatter が必要なので、既存 Work と同様のラッパを作る
-        class _AllGatherHandleWork(_ComchHandleWork):
-            def __init__(self, h, out_flat, out_list, like):
-                super().__init__(h)
-                self._out_flat = out_flat
-                self._out_list = out_list
-                self._like = like
-
-            def wait(self):
-                super().wait()
-                _scatter_flat_to_list(self._out_flat, self._out_list, self._like)
-                return None
-
-        return _AllGatherHandleWork(handle, output_flat, output_tensors, input_tensor)
 
 # =============================================================================
 # Benchmarks (DOCA)
 # =============================================================================
+
+def _bench_sizes():
+    """計測するサイズ（chunk = fp16 要素数）の一覧を返す。
+    環境変数 BENCH_SIZES（カンマ区切り）があればそれを使う。
+    例) BENCH_SIZES=65536,1048576,16777216 → 64KB / 1MB / 16MB (バイト = chunk*... の対応は
+        RS/AG とも per-rank メッセージ = chunk*2 bytes)。未設定なら既定のフルレンジ。"""
+    import os
+    env = os.environ.get("BENCH_SIZES")
+    if env:
+        return [int(x) for x in env.split(",") if x.strip()]
+    return [128, 1024, 4096, 16384, 65536, 262144, 1048576, 4194304, 8388608]
+
 
 def benchmark_doca_reduce_scatter_flat(
     device: torch.device,
@@ -416,17 +342,7 @@ def benchmark_doca_reduce_scatter_flat(
     rank = comm.Get_rank()
     world_size = comm.Get_size()
 
-    sizes = [
-        128,
-        1024,
-        4096,
-        16384,
-        65536,
-        262144,
-        1048576,
-        4194304,
-        8388608,
-    ]
+    sizes = _bench_sizes()
 
     base_cid = 100
     all_values = comm.allgather(value)
@@ -525,17 +441,7 @@ def benchmark_doca_all_gather_flat(
     rank = comm.Get_rank()
     world_size = comm.Get_size()
 
-    sizes = [
-        128,
-        1024,
-        4096,
-        16384,
-        65536,
-        262144,
-        1048576,
-        4194304,
-        8388608,
-    ]
+    sizes = _bench_sizes()
 
     base_cid = 200
     all_values = comm.allgather(value)
@@ -672,17 +578,7 @@ def benchmark_gpu_reduce_scatter_torch(
     comm = MPI.COMM_WORLD
     _init_torch_distributed_nccl(device)
 
-    sizes = [
-        128,
-        1024,
-        4096,
-        16384,
-        65536,
-        262144,
-        1048576,
-        4194304,
-        8388608,
-    ]
+    sizes = _bench_sizes()
 
     all_values = comm.allgather(value)
     expected_sum = float(sum(all_values))
@@ -771,17 +667,7 @@ def benchmark_gpu_all_gather_torch(
     comm = MPI.COMM_WORLD
     _init_torch_distributed_nccl(device)
 
-    sizes = [
-        128,
-        1024,
-        4096,
-        16384,
-        65536,
-        262144,
-        1048576,
-        4194304,
-        8388608,
-    ]
+    sizes = _bench_sizes()
 
     all_values = comm.allgather(value)
 
@@ -858,425 +744,6 @@ def benchmark_gpu_all_gather_torch(
                 f"BW={bw_gbps:7.2f} GB/s | correct={ok}"
             )
 
-#######################################
-###   SmartNIC中心CPUバッファ関数群   ###
-#######################################
-#新しく追加したフラッグポーリング用の関数
-import ctypes
-def poll_flag_seq(flag_tensor: torch.Tensor, expected: int,
-                  timeout_s: float = 5.0,
-                  sleep_us: int = 50,
-                  max_sleep_us: int = 2000):
-    """
-    flag_tensor: CPU上の int32 (shape=(1,)) pinned推奨
-    expected: 期待する seq 値
-    """
-    assert flag_tensor.device.type == "cpu"
-    assert flag_tensor.dtype == torch.int32
-    assert flag_tensor.numel() == 1
-
-    flag_ptr = ctypes.cast(int(flag_tensor.data_ptr()), ctypes.POINTER(ctypes.c_int32))
-
-    t0 = time.monotonic()
-    cur_sleep = sleep_us
-    while True:
-        if flag_ptr[0] == expected:
-            return True
-        if (time.monotonic() - t0) > timeout_s:
-            return False
-        # 少し待ちながら（忙しすぎるスピンを避ける）
-        time.sleep(cur_sleep / 1e6)
-        cur_sleep = min(cur_sleep * 2, max_sleep_us)
-
-
-def test_all_gather_full_cpu(
-    device: torch.device,
-    value: float,
-    num_iters: int = 10,
-    num_warmup: int = 10,
-):
-    comm = MPI.COMM_WORLD
-    rank = comm.Get_rank()
-    world_size = comm.Get_size()
-    base_cid = 200
-    all_values = comm.allgather(value)
-    
-    if rank == 0:
-        print("==== DOCA AllGather FULL CPU (flat) benchmark ====")
-        print(f"[INFO] num_warmup={num_warmup}, num_iters={num_iters}")
-    #テストコード
-    chunk = 1048576*2
-    cid = base_cid
-    #1. 各種メモリ領域の定義 (面倒なので一回投げます)
-    input_flat = torch.full(
-        (chunk,),
-        value,
-        dtype=torch.float16,
-        device="cpu",
-        pin_memory=True,
-    ).contiguous()
-    
-    output_flat = torch.empty(
-        (world_size * chunk,),
-        dtype=torch.float16,
-        device=device,
-    ).contiguous()
-    _cuda_touch_inplace(output_flat, "write_zero")
-    
-    full_param_flat = torch.empty(
-        (world_size * chunk,),
-        dtype=torch.float16,
-        device="cpu",
-        pin_memory=True,
-    ).contiguous()
-    full_param_flat.zero_()
-    
-    # 受信側/送信側どちらでも「RDMAで見えるフラグ領域」として確保
-    full_param_flag = torch.zeros(
-        (1,),
-        dtype=torch.int32,
-        device="cpu",
-        pin_memory=True,   # CUDA転送にも使うなら有益。RDMAだけなら必須ではないケースもある
-    ).contiguous()
-    # クリア
-    full_param_flag[0] = 0
-    
-    #2. DOCA側のAllGather➡full_param移動の関数を投げる
-    comm.Barrier()
-    all_gather_cpu_full_flat_via_base(output_flat, input_flat, full_param_flat, full_param_flag, cid=cid, async_op=False)
-    comm.Barrier()
-        
-    #3. 終了処理 ➡ AllGatherの結果
-    out_2d = output_flat.view(world_size, chunk)
-    ok = True
-    for src_rank, v in enumerate(all_values):
-        row = out_2d[src_rank]
-        if not torch.allclose(row, torch.full_like(row, v), rtol=1e-4, atol=1e-4):
-            ok = False
-            max_err = (row - v).abs().max().item()
-            if rank == 0:
-                print(
-                    f"[ERROR][DOCA AG flat] rank={rank}, N={chunk}, src_rank={src_rank}: "
-                    f"mismatch (max abs error={max_err})"
-                )
-                torch.set_printoptions(threshold=float('inf'))  # 省略なし
-                print(output_flat)
-            sys.exit()
-            break
-    
-    #4. フラッグがついたかのポーリング
-    ok = poll_flag_seq(full_param_flag, 1)
-    if not ok:
-        if rank == 0:
-            print(f"[TIMEOUT] flag={int(full_param_flag.item())}")
-        comm.Abort(1)
-            
-    #5. CPUメモリ領域の確認 output flatとまったく同じ値になっているはず
-    # output_flat を CPU 側に持ってくる（GPUなら pinned staging を使う）
-    if output_flat.device.type != "cpu":
-        output_cpu = torch.empty_like(
-            full_param_flat,  # shape/dtype を揃える
-            device="cpu",
-            pin_memory=True,
-        )
-        output_cpu.copy_(output_flat, non_blocking=True)
-        if output_flat.is_cuda:
-            torch.cuda.synchronize(device=output_flat.device)
-    else:
-        output_cpu = output_flat
-
-    # 比較（基本は allclose。bitwise 完全一致を期待するなら torch.equal も可）
-    if not torch.allclose(full_param_flat, output_cpu, rtol=1e-4, atol=1e-4):
-        diff = (full_param_flat - output_cpu).abs()
-        max_err = diff.max().item()
-        idx = int(diff.argmax().item())
-
-        if rank == 0:
-            print(f"[ERROR][FULL_PARAM] mismatch: max abs err={max_err} at flat idx={idx}")
-
-            # 周辺を少しだけ表示（float16のままだと見にくいのでfloat32にする）
-            s = max(0, idx - 8)
-            e = min(diff.numel(), idx + 8)
-            print("full_param_flat[s:e] =", full_param_flat[s:e].to(torch.float32))
-            print("output_cpu[s:e]      =", output_cpu[s:e].to(torch.float32))
-
-        comm.Abort(1)
-    else:
-        if rank == 0:
-            print("[OK] full_param_flat matches output_flat (within tol)")
-
-
-def test_all_gather_full_cpu_multi_params(
-    device: torch.device,
-    value: float,
-    num_iters: int = 10,
-    num_warmup: int = 10,
-):
-    comm = MPI.COMM_WORLD
-    rank = comm.Get_rank()
-    world_size = comm.Get_size()
-    base_cid = 200
-    all_values = comm.allgather(value)
-    
-    if rank == 0:
-        print("==== DOCA AllGather FULL CPU (flat) benchmark ====")
-        print(f"[INFO] num_warmup={num_warmup}, num_iters={num_iters}")
-    #テストコード
-    chunk = 16
-    cid = base_cid
-    #1. 各種メモリ領域の定義
-    #1-1 各paramsのサイズを保持した配列を定義
-    params_sizes = [chunk, chunk, chunk, chunk]
-    partition_sz = sum(params_sizes)
-    
-    #出力用のテンソル
-    output_flat = torch.empty(partition_sz*world_size, dtype=torch.float16, device=torch.cuda.current_device(), requires_grad=False).contiguous()
-    flat_view = output_flat.view(-1)
-    
-    input_params = [
-        torch.full((sz,), value * (i + 1), dtype=torch.float16, device="cpu", pin_memory=True).contiguous()
-        for i, sz in enumerate(params_sizes)
-    ]
-    input_flat_cpu = torch.empty(partition_sz, dtype=torch.float16, device="cpu", pin_memory=True).contiguous()
-    offset = 0
-    for p in input_params:
-        n = p.numel()
-        input_flat_cpu.narrow(0, offset, n).copy_(p.detach().view(-1))
-        offset += n
-    
-    # full_param_flats は出力テンソルと同形の連続領域を確保し、view として各 param に切り出す。
-    full_param_flats = torch.empty(partition_sz*world_size, dtype=torch.float16, device="cpu", requires_grad=False).contiguous()
-    #input_flat_cpuと同様にfull_param_flatsからviewとして切り出す
-    full_param_2d = full_param_flats.view(world_size, partition_sz)                                     
-    local_cpu_full_params = []                                                                          
-    offset = 0                                                                                          
-    for sz in params_sizes:                                                                             
-        # shape: (world_size, sz) — param p_idx の全ランク分                                            
-        local_cpu_full_params.append(full_param_2d[:, offset:offset + sz])                              
-        offset += sz
-
-    # full_param_flagsを連続領域として一括確保し、各パラメータ分をviewで切り出す
-    # 各パラメータにつきint32を1要素ずつ持つ
-    num_params = len(params_sizes)
-    full_param_flags = torch.zeros(
-        (num_params,),
-        dtype=torch.int32,
-        device="cpu",
-        pin_memory=True,
-    ).contiguous()
-    local_cpu_full_param_flags = [
-        full_param_flags.narrow(0, i, 1) for i in range(num_params)
-    ]
-    
-    #2. DOCA側のAllGather➡full_param移動の関数を投げる
-    #ここは修正なし (既存APIで実行する)
-    comm.Barrier()
-    all_gather_cpu_full_flat_via_base(flat_view, input_flat_cpu, full_param_flats, full_param_flags, cid=cid, async_op=False)
-    comm.Barrier()
-        
-    #3. 終了処理 ➡ AllGatherの結果を各パラメータごとに確認
-    for p_idx, sz in enumerate(params_sizes):
-        param_offset = sum(params_sizes[:p_idx])
-        ok = True
-        for src_rank, v in enumerate(all_values):
-            start = src_rank * partition_sz + param_offset
-            row = output_flat[start : start + sz]
-            if not torch.allclose(row, torch.full_like(row, v * (p_idx + 1)), rtol=1e-4, atol=1e-4):
-                ok = False
-                max_err = (row - v).abs().max().item()
-                if rank == 0:
-                    print(
-                        f"[ERROR][DOCA AG flat] rank={rank}, param={p_idx}, src_rank={src_rank}: "
-                        f"mismatch (max abs error={max_err})"
-                        f"output_flat={output_flat}"
-                    )
-                sys.exit()
-                break
-        if ok and rank == 0:
-            print(f"[OK] AllGather output check passed for param {p_idx}")
-
-    #4. フラッグがついたかのポーリング（各パラメータごと）
-    for p_idx in range(num_params):
-        ok = poll_flag_seq(local_cpu_full_param_flags[p_idx], 1)
-        if not ok:
-            if rank == 0:
-                print(f"[TIMEOUT] param={p_idx}, flag={int(local_cpu_full_param_flags[p_idx].item())}")
-            comm.Abort(1)
-
-    #5. CPUメモリ領域の確認（各パラメータごとにlocal_cpu_full_paramsとGPU出力を比較）
-    for p_idx, sz in enumerate(params_sizes):
-        cpu_full = local_cpu_full_params[p_idx]  # size: sz * world_size
-
-        # output_flatから該当パラメータ分をランクごとに抽出して連結
-        param_offset = sum(params_sizes[:p_idx])
-        gpu_slices = []
-        for src_rank in range(world_size):
-            start = src_rank * partition_sz + param_offset
-            gpu_slices.append(output_flat[start : start + sz])
-        gpu_full = torch.stack(gpu_slices)  # shape: (world_size, sz)
-
-        # GPU→CPUへ転送
-        if gpu_full.device.type != "cpu":
-            output_cpu = torch.empty_like(cpu_full, device="cpu", pin_memory=True)
-            output_cpu.copy_(gpu_full, non_blocking=True)
-            if gpu_full.is_cuda:
-                torch.cuda.synchronize(device=gpu_full.device)
-        else:
-            output_cpu = gpu_full
-
-        if not torch.allclose(cpu_full, output_cpu, rtol=1e-4, atol=1e-4):
-            diff = (cpu_full - output_cpu).abs()
-            max_err = diff.max().item()
-            idx = int(diff.argmax().item())
-            if rank == 0:
-                print(f"[ERROR][FULL_PARAM] param={p_idx}: mismatch, max abs err={max_err} at idx={idx}")
-                s = max(0, idx - 8)
-                e = min(diff.numel(), idx + 8)
-                print(f"  cpu_full[{s}:{e}] =", cpu_full[s:e].to(torch.float32))
-                print(f"  output_cpu[{s}:{e}] =", output_cpu[s:e].to(torch.float32))
-            comm.Abort(1)
-        else:
-            if rank == 0:
-                print(f"[OK] full_param matches output for param {p_idx}"
-                      f"cpu_full={cpu_full}")
-
-def test_all_gather_full_cpu_list(
-    device: torch.device,
-    value: float,
-    num_iters: int = 10,
-    num_warmup: int = 10,
-):
-    comm = MPI.COMM_WORLD
-    rank = comm.Get_rank()
-    world_size = comm.Get_size()
-    base_cid = 200
-    all_values = comm.allgather(value)
-    
-    if rank == 0:
-        print("==== DOCA AllGather FULL CPU LIST (flat) benchmark ====")
-        print(f"[INFO] num_warmup={num_warmup}, num_iters={num_iters}")
-    #テストコード
-    chunk = 1048576//4
-    cid = base_cid
-    #1. 各種メモリ領域の定義
-    #1-1 各paramsのサイズを保持した配列を定義
-    params_sizes = [chunk, chunk, chunk, chunk]
-    partition_sz = sum(params_sizes)
-    tensor_size = partition_sz * world_size
-    
-    param_list = [
-            torch.full((sz,), value * (i + 1), dtype=torch.float16, device="cpu", pin_memory=True).contiguous()
-            for i, sz in enumerate(params_sizes)
-        ]
-    
-    flat_tensor = torch.empty(tensor_size, dtype=torch.float16, device=torch.cuda.current_device()).contiguous()
-    partitions = []
-    for i in range(world_size):
-        start = partition_sz * i
-        partitions.append(flat_tensor.narrow(0, start, partition_sz))
-        if i == rank:
-            offset = 0
-            for param in param_list:
-                param_numel = param.numel()
-                partitions[i].narrow(0, offset, param_numel).copy_(param.data)
-                offset += param_numel
-                
-    # full_param_flats は出力テンソルと同形の連続領域を確保し、view として各 param に切り出す。
-    full_param_flats = torch.empty(partition_sz*world_size, dtype=torch.float16, device="cpu", requires_grad=False).contiguous()
-    #input_flat_cpuと同様にfull_param_flatsからviewとして切り出す
-    full_param_2d = full_param_flats.view(world_size, partition_sz)                                     
-    local_cpu_full_params = []                                                                          
-    offset = 0                                                                                          
-    for sz in params_sizes:                                                                             
-        # shape: (world_size, sz) — param p_idx の全ランク分                                            
-        local_cpu_full_params.append(full_param_2d[:, offset:offset + sz])                              
-        offset += sz
-
-    # full_param_flagsを連続領域として一括確保し、各パラメータ分をviewで切り出す
-    # 各パラメータにつきint32を1要素ずつ持つ
-    num_params = len(params_sizes)
-    full_param_flags = torch.zeros(
-        (num_params,),
-        dtype=torch.int32,
-        device="cpu",
-        pin_memory=True,
-    ).contiguous()
-    local_cpu_full_param_flags = [
-        full_param_flags.narrow(0, i, 1) for i in range(num_params)
-    ]
-    
-    all_gather_cpu_full_list_via_base(
-            output_tensors=partitions,
-            input_tensor=partitions[rank],
-            cpu_full_flat=full_param_flats, 
-            cpu_full_flag=full_param_flags,
-            cid=cid,
-            async_op=False,
-        )
-    
-    #3. AllGatherの結果を各パラメータごとに確認（GPU側: flat_tensor）
-    for p_idx, sz in enumerate(params_sizes):
-        param_offset = sum(params_sizes[:p_idx])
-        ok = True
-        for src_rank, v in enumerate(all_values):
-            start = src_rank * partition_sz + param_offset
-            row = flat_tensor[start : start + sz]
-            if not torch.allclose(row, torch.full_like(row, v * (p_idx + 1)), rtol=1e-4, atol=1e-4):
-                ok = False
-                max_err = (row - v * (p_idx + 1)).abs().max().item()
-                if rank == 0:
-                    print(
-                        f"[ERROR][DOCA AG list] rank={rank}, param={p_idx}, src_rank={src_rank}: "
-                        f"mismatch (max abs error={max_err})"
-                    )
-                sys.exit()
-                break
-        if ok and rank == 0:
-            print(f"[OK] AllGather list output check passed for param {p_idx}")
-
-    #4. フラッグがついたかのポーリング（各パラメータごと）
-    for p_idx in range(num_params):
-        ok = poll_flag_seq(local_cpu_full_param_flags[p_idx], 1)
-        if not ok:
-            if rank == 0:
-                print(f"[TIMEOUT] param={p_idx}, flag={int(local_cpu_full_param_flags[p_idx].item())}")
-            comm.Abort(1)
-
-    #5. CPUメモリ領域の確認（各パラメータごとにlocal_cpu_full_paramsとGPU出力を比較）
-    for p_idx, sz in enumerate(params_sizes):
-        cpu_full = local_cpu_full_params[p_idx]  # shape: (world_size, sz)
-
-        # flat_tensorから該当パラメータ分をランクごとに抽出して連結
-        param_offset = sum(params_sizes[:p_idx])
-        gpu_slices = []
-        for src_rank in range(world_size):
-            start = src_rank * partition_sz + param_offset
-            gpu_slices.append(flat_tensor[start : start + sz])
-        gpu_full = torch.stack(gpu_slices)  # shape: (world_size, sz)
-
-        # GPU→CPUへ転送
-        if gpu_full.device.type != "cpu":
-            output_cpu = torch.empty_like(cpu_full, device="cpu", pin_memory=True)
-            output_cpu.copy_(gpu_full, non_blocking=True)
-            if gpu_full.is_cuda:
-                torch.cuda.synchronize(device=gpu_full.device)
-        else:
-            output_cpu = gpu_full
-
-        if not torch.allclose(cpu_full, output_cpu, rtol=1e-4, atol=1e-4):
-            diff = (cpu_full - output_cpu).abs()
-            max_err = diff.max().item()
-            idx = int(diff.argmax().item())
-            if rank == 0:
-                print(f"[ERROR][FULL_PARAM list] param={p_idx}: mismatch, max abs err={max_err} at idx={idx}")
-                s = max(0, idx - 8)
-                e = min(diff.numel(), idx + 8)
-                print(f"  cpu_full[{s}:{e}] =", cpu_full[s:e].to(torch.float32))
-                print(f"  output_cpu[{s}:{e}] =", output_cpu[s:e].to(torch.float32))
-            comm.Abort(1)
-        else:
-            if rank == 0:
-                print(f"[OK] full_param list matches output for param {p_idx}")
 
 # =============================================================================
 # main
@@ -1315,21 +782,19 @@ def main():
 
 
     # ---- run benchmarks ----
-    if args.run in ("doca_rs", "all"):
+    # 環境変数 BENCH_RUN があれば --run を上書き。"doca" は DOCA の RS/AG 両方（NCCL を省略）。
+    run_sel = os.environ.get("BENCH_RUN", args.run)
+    if run_sel in ("doca_rs", "doca", "all"):
         benchmark_doca_reduce_scatter_flat(device=device, value=value)
-        pass
 
-    if args.run in ("doca_ag", "all"):
+    if run_sel in ("doca_ag", "doca", "all"):
         benchmark_doca_all_gather_flat(device=device, value=value)
-        pass
-    
-    if args.run in ("nccl_rs", "all"):
-        benchmark_gpu_reduce_scatter_torch(device=device, value=value, rank=rank, world_size=world_size)
-        pass
 
-    if args.run in ("nccl_ag", "all"):
+    if run_sel in ("nccl_rs", "all"):
+        benchmark_gpu_reduce_scatter_torch(device=device, value=value, rank=rank, world_size=world_size)
+
+    if run_sel in ("nccl_ag", "all"):
         benchmark_gpu_all_gather_torch(device=device, value=value, rank=rank, world_size=world_size)
-        pass
 
     # ---- finalize ----
     comm.Barrier()

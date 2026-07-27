@@ -1074,6 +1074,7 @@ def run_zero(use_profiler=False, use_bf16=False, use_ema=False,
             print("Loss history:", loss_history)
             print("Accuracy history:", accuracy_history)
             
+            '''
             summary = summarize_by_submodule()
 
             # 見やすさのため、fwd_exec の total が大きい順に並べる（無い場合は 0）
@@ -1156,6 +1157,7 @@ def run_zero(use_profiler=False, use_bf16=False, use_ema=False,
                         print("=" * 70)
                 except Exception as _e:
                     print(f"[warn] Phase 20 stall dump failed: {_e}")
+            '''
 
     finally:
         if profiler and hasattr(profiler, "stop"):

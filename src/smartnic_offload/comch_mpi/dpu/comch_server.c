@@ -47,6 +47,50 @@ DOCA_LOG_REGISTER(COMCH_SERVER);
 #define AG_TIMING_MAX_OPS    20
 #define AG_TIMING_MAX_ITERS  100
 
+/* =====================================================
+ * コア割り当て設定（1 DPU = 2 ランク, 計 16 コア想定）
+ *   ワークロードの性質で配置方針を変える:
+ *     - 通信 progress : busy-poll のため rank 分離（3 worker を C コアに packing）
+ *     - 計算 RS 集約  : バースト的・メモリ律速のため rank 共有（動的バースト＋MLP）
+ *   env で実行時変更可（再ビルド不要でスイープ）:
+ *     COMM_CORES    : 通信 progress の rank あたりコア数 C (1..DOCA_WORKER_TYPE_COUNT, default 3)
+ *     COMPUTE_CORES : 計算 RS 集約スレッド数 K（rank 共有, default 6）
+ *   制約: 2*C + K + 4 <= 16（超過分は K を自動クランプ）
+ *   レイアウト（自動計算）:
+ *     comm[0..2C-1](rank別) | msg[2C,2C+1](rank別) | compute[2C+2 .. +K-1](共有) | main(rank別)
+ * ===================================================== */
+#define COMM_CORES_DEFAULT     3
+#define COMPUTE_CORES_DEFAULT  6
+
+static int g_comm_cores    = COMM_CORES_DEFAULT;
+static int g_compute_cores = COMPUTE_CORES_DEFAULT;
+/* CrossGVMI アブレーション用: 1 なら AG の GPU 直接アクセス(PCI cross-GVMI import)を無効化し、
+ * host_dst_rmem/host_src_rmem 経由の RDMA staging 経路に落とす（gpu_direct を強制 off）。
+ * RS には影響させない（RS は reduction のため常に DPU に取り込むので staging の概念が無い）。 */
+static int g_force_staging = 0;
+
+static void core_alloc_init_from_env(void)
+{
+    const char *c = getenv("COMM_CORES");
+    const char *k = getenv("COMPUTE_CORES");
+    const char *fs = getenv("FORCE_STAGING");
+    if (c) { int v = atoi(c); if (v >= 1 && v <= (int)DOCA_WORKER_TYPE_COUNT) g_comm_cores = v; }
+    if (k) { int v = atoi(k); if (v >= 1) g_compute_cores = v; }
+    g_force_staging = (fs && atoi(fs) != 0) ? 1 : 0;
+    int maxk = 16 - 4 - 2 * g_comm_cores;      /* 2*C + K + 4 <= 16 */
+    if (g_compute_cores > maxk) g_compute_cores = maxk;
+    if (g_compute_cores < 1)   g_compute_cores = 1;
+    DOCA_LOG_INFO("core alloc: COMM_CORES=%d COMPUTE_CORES=%d (2*C+K+4=%d) FORCE_STAGING=%d",
+                  g_comm_cores, g_compute_cores, 2 * g_comm_cores + g_compute_cores + 4, g_force_staging);
+}
+
+/* 3 progress worker を C コアに packing（rank 分離） */
+static inline int comm_core(int rank, int i)  { return (rank % 2) * g_comm_cores + (i % g_comm_cores); }
+static inline int msg_pool_core(int rank)     { return 2 * g_comm_cores + (rank % 2); }
+static inline int compute_core_base(void)     { return 2 * g_comm_cores + 2; }
+static inline int compute_core(int i)         { return compute_core_base() + i; }               /* 共有 */
+static inline int main_core(int rank)         { return compute_core_base() + g_compute_cores + (rank % 2); }
+
 enum ag_op_name {
     AG_OP_READ = 0,
     AG_OP_WRITE,
@@ -531,7 +575,6 @@ fail:
 static void *doca_worker_thread_main(void *arg)
 {
     struct doca_worker_thread_ctx *ctx = (struct doca_worker_thread_ctx *)arg;
-    struct doca_rdma_ctx_t *rdma_ctx = ctx->rdma_ctx;
     spsc_doca_task_queue_t *tq = (spsc_doca_task_queue_t *)ctx->task_queue;
 
     cpu_set_t cpuset;
@@ -539,37 +582,28 @@ static void *doca_worker_thread_main(void *arg)
     CPU_SET(ctx->core_id, &cpuset);
     pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
 
-    struct doca_rdma_ctx_t *rdma_ctx_rail1 = ctx->rdma_ctx_rail1;
-
     while (atomic_load(&ctx->running)) {
         bool did_work = false;
         struct doca_task_desc task;
 
+        /* task_queue は EXIT 通知のみ（hot path のタスクは inline 提出） */
         while (spsc_doca_task_queue_pop(tq, &task)) {
-            did_work = true;
             if (task.type == DOCA_RDMA_TASK_EXIT) {
                 atomic_store(&ctx->running, false);
                 break;
             }
-            /* Multi-Rail: タスク記述子の rdma_ctx を使用 (rail0 or rail1) */
-            struct doca_rdma_ctx_t *task_ctx = task.rdma_ctx ? task.rdma_ctx : rdma_ctx;
-            submit_doca_task_from_desc(task_ctx, &task, ctx);
         }
 
-        /* Phase 6 Step F: PE progress with trylock (allows main thread concurrent access) */
-        if (ctx->pe_spin && rdma_ctx && rdma_ctx->pe) {
-            if (try_pe_progress(rdma_ctx->pe, ctx->pe_spin))
-                did_work = true;
-        } else if (rdma_ctx && rdma_ctx->pe) {
-            if (doca_pe_progress(rdma_ctx->pe))
-                did_work = true;
-        }
-        if (ctx->pe_spin_rail1 && rdma_ctx_rail1 && rdma_ctx_rail1->pe) {
-            if (try_pe_progress(rdma_ctx_rail1->pe, ctx->pe_spin_rail1))
-                did_work = true;
-        } else if (rdma_ctx_rail1 && rdma_ctx_rail1->pe) {
-            if (doca_pe_progress(rdma_ctx_rail1->pe))
-                did_work = true;
+        /* 担当 PE を round-robin で progress（pe_spin で inline 実行と排他） */
+        for (int j = 0; j < ctx->n_pe; j++) {
+            struct doca_rdma_ctx_t *rc = ctx->pe_ctx[j];
+            struct pe_spin_t *spin = ctx->pe_spins[j];
+            if (!rc || !rc->pe) continue;
+            if (spin) {
+                if (try_pe_progress(rc->pe, spin)) did_work = true;
+            } else {
+                if (doca_pe_progress(rc->pe)) did_work = true;
+            }
         }
 
         if (!did_work) {
@@ -619,38 +653,55 @@ static int doca_worker_thread_pool_init(
         cw->conn_to_next_rail1 ? &cw->ring_send_pe_spin_rail1 : NULL,
     };
 
-    for (int i = 0; i < DOCA_WORKER_TYPE_COUNT; i++) {
-        struct doca_worker_thread_ctx *w = &pool->workers[i];
-        w->worker_type = (doca_worker_type_t)i;
-        w->core_id = (mpi_rank % 2) * 3 + i;
-        w->rdma_ctx = ctx_map[i];
-        /* Multi-Rail: 各ワーカに rail1 コンテキストを設定 */
-        if (i == DOCA_WORKER_TYPE_RMA && cw->dual_rail)
-            w->rdma_ctx_rail1 = &cw->rdma_rma_rail1;
-        else if (i == DOCA_WORKER_TYPE_RING_RECV && cw->conn_from_prev_rail1)
-            w->rdma_ctx_rail1 = &cw->rdma_ring_recv_rail1;
-        else if (i == DOCA_WORKER_TYPE_RING_SEND && cw->conn_to_next_rail1)
-            w->rdma_ctx_rail1 = &cw->rdma_ring_send_rail1;
-        else
-            w->rdma_ctx_rail1 = NULL;
+    /* rail1 の context マップ（rail1 spinlock が非 NULL のときのみ有効） */
+    struct doca_rdma_ctx_t *rail1_ctx_map[DOCA_WORKER_TYPE_COUNT] = {
+        &cw->rdma_rma_rail1,
+        &cw->rdma_ring_recv_rail1,
+        &cw->rdma_ring_send_rail1,
+    };
 
-        /* Phase 6 Step F: PE spinlock ポインタ設定 */
-        w->pe_spin = spin_map[i];
-        w->pe_spin_rail1 = spin_rail1_map[i];
+    /* Option 2: N = g_comm_cores 本のワーカ。役割 → ワーカを role % N で配分し、
+     * 各ワーカが担当役割の rail0/rail1 PE を round-robin progress する。
+     * role 順 [RMA(0), RECV(1), SEND(2)] なので N>=2 で RECV/SEND は別ワーカになる。 */
+    int N = g_comm_cores;
+    if (N < 1) N = 1;
+    if (N > DOCA_WORKER_TYPE_COUNT) N = DOCA_WORKER_TYPE_COUNT;
+    pool->n_workers = N;
 
+    for (int w = 0; w < N; w++) {
+        struct doca_worker_thread_ctx *wk = &pool->workers[w];
+        wk->worker_type = (doca_worker_type_t)w;
+        wk->core_id = comm_core(mpi_rank, w);
+        wk->n_pe = 0;
+    }
+    for (int r = 0; r < DOCA_WORKER_TYPE_COUNT; r++) {
+        struct doca_worker_thread_ctx *wk = &pool->workers[r % N];
+        wk->pe_ctx[wk->n_pe]   = ctx_map[r];       /* rail0 */
+        wk->pe_spins[wk->n_pe] = spin_map[r];
+        wk->n_pe++;
+        if (spin_rail1_map[r]) {                    /* rail1（条件成立時のみ） */
+            wk->pe_ctx[wk->n_pe]   = rail1_ctx_map[r];
+            wk->pe_spins[wk->n_pe] = spin_rail1_map[r];
+            wk->n_pe++;
+        }
+    }
+
+    for (int w = 0; w < N; w++) {
+        struct doca_worker_thread_ctx *wk = &pool->workers[w];
         spsc_doca_task_queue_t *tq = (spsc_doca_task_queue_t *)calloc(1, sizeof(*tq));
         spsc_completion_queue_t *cq = (spsc_completion_queue_t *)calloc(1, sizeof(*cq));
         if (!tq || !cq) { free(tq); free(cq); return -1; }
         spsc_doca_task_queue_init(tq);
         spsc_completion_queue_init(cq);
-        w->task_queue = tq;
-        w->completion_queue = cq;
-        atomic_init(&w->running, true);
-        atomic_init(&w->paused, false);
-        atomic_init(&w->paused_ack, false);
+        wk->task_queue = tq;
+        wk->completion_queue = cq;
+        atomic_init(&wk->running, true);
+        atomic_init(&wk->paused, false);
+        atomic_init(&wk->paused_ack, false);
 
-        if (pthread_create(&w->thread, NULL, doca_worker_thread_main, w) != 0) {
-            atomic_store(&w->running, false);
+        DOCA_LOG_INFO("comm worker %d: core=%d n_pe=%d", w, wk->core_id, wk->n_pe);
+        if (pthread_create(&wk->thread, NULL, doca_worker_thread_main, wk) != 0) {
+            atomic_store(&wk->running, false);
             free(tq); free(cq);
             return -1;
         }
@@ -663,7 +714,7 @@ static void doca_worker_thread_pool_destroy(struct doca_worker_thread_pool_t *po
 {
     if (!pool || !atomic_load(&pool->initialized)) return;
 
-    for (int i = 0; i < DOCA_WORKER_TYPE_COUNT; i++) {
+    for (int i = 0; i < pool->n_workers; i++) {
         struct doca_worker_thread_ctx *w = &pool->workers[i];
         spsc_doca_task_queue_t *tq = (spsc_doca_task_queue_t *)w->task_queue;
         if (tq) {
@@ -673,7 +724,7 @@ static void doca_worker_thread_pool_destroy(struct doca_worker_thread_pool_t *po
             spsc_doca_task_queue_push(tq, &exit_task);
         }
     }
-    for (int i = 0; i < DOCA_WORKER_TYPE_COUNT; i++) {
+    for (int i = 0; i < pool->n_workers; i++) {
         struct doca_worker_thread_ctx *w = &pool->workers[i];
         if (w->thread) pthread_join(w->thread, NULL);
         free(w->task_queue);
@@ -765,10 +816,9 @@ static void submit_and_wait_doca(
  * 集約用スレッドプール (rs_thread_pool) — UNCHANGED
  * ===================================================== */
 
-/* RS_NUM_THREADS: 6→8 に拡張 (cores 8-15 を使用)。
- * cores 14, 15 は main thread (busy-spin PE progress) と同居するため、
- * 性能が悪化した場合は 6 に戻す (cores 8-13、main 衝突なし)。 */
-#define RS_NUM_THREADS           8
+/* RS_NUM_THREADS: フォールバック用デフォルト。実際の計算スレッド数は
+ * 実行時 g_compute_cores（env COMPUTE_CORES）を使用。ピン留めは compute_core(i)（rank 共有）。 */
+#define RS_NUM_THREADS           COMPUTE_CORES_DEFAULT
 #define RS_AGGREGATION_THRESHOLD (256 * 1024)
 
 #define RS_JOB_OP_ADD   0
@@ -929,7 +979,7 @@ rs_thread_pool_create(struct rs_thread_pool_t **out_pool, int num_threads)
             return DOCA_ERROR_NO_MEMORY;
         }
         cpu_set_t cpuset; CPU_ZERO(&cpuset);
-        CPU_SET(8 + i, &cpuset);
+        CPU_SET(compute_core(i), &cpuset);
         pthread_setaffinity_np(pool->threads[i], sizeof(cpu_set_t), &cpuset);
     }
     *out_pool = pool;
@@ -1910,7 +1960,7 @@ static int msg_pool_init(struct msg_thread_pool *p, int mpi_rank,
             return -1;
         }
         cpu_set_t cpuset; CPU_ZERO(&cpuset);
-        CPU_SET(6 + (mpi_rank % 2), &cpuset);
+        CPU_SET(msg_pool_core(mpi_rank), &cpuset);
         pthread_setaffinity_np(p->threads[i], sizeof(cpu_set_t), &cpuset);
     }
     return 0;
@@ -2941,7 +2991,8 @@ static doca_error_t collective_all_gather(
         }
         if (idx >= 0 && _ag_dbg_seen[idx].printed_count < _AG_DBG_PRINT_PER_SIZE) {
             _ag_dbg_seen[idx].printed_count++;
-            _ag_step_dbg_print = true;
+            /* 計測ログ [AG STEP ...] を無効化 (2026-07-27) */
+            /* _ag_step_dbg_print = true; */
         }
     }
     uint64_t _ag_step_submit_ns[16] = {0};
@@ -3906,7 +3957,7 @@ void execute_doca_create_ring_cmd(struct control_cmd *recv_cmd, struct comch_ctr
 
     /* ---- 5. RS スレッドプール初期化 ---- */
     if (cw->rs_pool == NULL) {
-        ret = rs_thread_pool_create(&cw->rs_pool, RS_NUM_THREADS);
+        ret = rs_thread_pool_create(&cw->rs_pool, g_compute_cores);
         if (ret != DOCA_SUCCESS) {
             DOCA_LOG_ERR("Failed to create rs_thread_pool");
             cw->rs_pool = NULL;
@@ -4245,6 +4296,15 @@ void execute_doca_collective_cmd(struct control_cmd *recv_cmd, struct comch_ctrl
 
     /* GPU Direct AG かどうかを判定 (PCI import が両方成功 かつ AG) */
     bool is_ag = (recv_cmd->ucp_collective.collective_request.collective_op == COLLECTIVE_ALL_GATHER);
+    /* CrossGVMI アブレーション: FORCE_STAGING=1 かつ AG なら PCI import 済み mmap を捨て、
+     * gpu_direct を強制 off → host_dst_rmem/host_src_rmem 経由の RDMA staging 経路に落とす。
+     * （RS は対象外。mmap キャッシュ自体は保持し、この op だけ staging にする。） */
+    if (g_force_staging && is_ag) {
+        gpu_dst_local_mmap = NULL;
+        gpu_src_local_mmap = NULL;
+        gpu_dst_local_mmap_rail1 = NULL;
+        gpu_src_local_mmap_rail1 = NULL;
+    }
     bool gpu_direct_ag = is_ag && gpu_dst_local_mmap && gpu_src_local_mmap;
 
     /* ---- 1. リモートメモリ作成 (キャッシュ付き) ---- */
@@ -4510,9 +4570,11 @@ void execute_doca_collective_cmd(struct control_cmd *recv_cmd, struct comch_ctrl
             g_phase13a_records[slot13a].barrier_us = (uint32_t)(g_per_op_barrier_ns / 1000);
         }
 
-        /* Phase 16: 5000 ops 蓄積したら rank 0 で 1 回だけ top-N 出力
-         *   (旧: 10000 ops。50 step training は AG ~9300 + RS 180 = ~9481 ops のみのため
-         *    10000 に到達せず summary が fire しなかった。5000 に下げて確実に fire させる。) */
+#if 0 /* 計測ダンプ [DPU PER-OP] / [Rank Skew] / Phase16/17 を無効化 (2026-07-27)。
+       * 5000 op 到達時に 1 回だけ発火する集計出力。phase13a_gather_and_print は
+       * MPI_Gather を含むが全 rank でこの経路を通るため、丸ごと無効化しても collective
+       * の不整合は起きない (全 rank が一様に skip)。 */
+        /* Phase 16: 5000 ops 蓄積したら rank 0 で 1 回だけ top-N 出力 */
         if (sample_objects->rank == 0) {
             static int _printed = 0;
             if (!_printed && (slot + 1) >= 5000) {
@@ -4527,6 +4589,7 @@ void execute_doca_collective_cmd(struct control_cmd *recv_cmd, struct comch_ctrl
         if ((slot13a + 1) >= 5000 && !g_phase13a_gathered) {
             phase13a_gather_and_print();
         }
+#endif
     }
 
     {
@@ -5202,9 +5265,11 @@ int main(int argc, char **argv)
     MPI_Comm_size(MPI_COMM_WORLD, &tmp_world_size);
     uint64_t rank = (uint64_t)tmp_rank, world_size = (uint64_t)tmp_world_size;
 
+    core_alloc_init_from_env();   /* COMM_CORES / COMPUTE_CORES を env から反映（全ピン留めより前） */
+
     {
         cpu_set_t cpuset; CPU_ZERO(&cpuset);
-        int main_cpu_id = 14 + (tmp_rank % 2);
+        int main_cpu_id = main_core(tmp_rank);
         CPU_SET(main_cpu_id, &cpuset);
         pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
     }

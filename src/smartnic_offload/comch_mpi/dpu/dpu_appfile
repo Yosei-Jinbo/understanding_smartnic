@@ -1,4 +1,4 @@
--n 1 -host dpu02:1 -x GID_INDEX=1 -x RDB_DISABLE=1 -x AG_PIECE_MAX=8 /tmp/build/doca_comch_server collective_server 03:00.0 cf:00.0 enp3s0f0s0
--n 1 -host dpu02:1 -x GID_INDEX=1 -x RDB_DISABLE=1 -x AG_PIECE_MAX=8 /tmp/build/doca_comch_server collective_server 03:00.1 cf:00.1 enp3s0f1s0
--n 1 -host dpu01:1 -x GID_INDEX=1 -x RDB_DISABLE=1 -x AG_PIECE_MAX=8 /tmp/build/doca_comch_server collective_server 03:00.1 cf:00.1 enp3s0f1s0
--n 1 -host dpu01:1 -x GID_INDEX=1 -x RDB_DISABLE=1 -x AG_PIECE_MAX=8 /tmp/build/doca_comch_server collective_server 03:00.0 cf:00.0 enp3s0f0s0
+-n 1 -host dpu02:1 -x GID_INDEX=1 -x RDB_DISABLE=1 -x AG_PIECE_MAX -x COMM_CORES -x COMPUTE_CORES -x FORCE_STAGING /tmp/build/doca_comch_server collective_server 03:00.0 cf:00.0 enp3s0f0s0
+-n 1 -host dpu02:1 -x GID_INDEX=1 -x RDB_DISABLE=1 -x AG_PIECE_MAX -x COMM_CORES -x COMPUTE_CORES -x FORCE_STAGING /tmp/build/doca_comch_server collective_server 03:00.1 cf:00.1 enp3s0f1s0
+-n 1 -host dpu01:1 -x GID_INDEX=1 -x RDB_DISABLE=1 -x AG_PIECE_MAX -x COMM_CORES -x COMPUTE_CORES -x FORCE_STAGING /tmp/build/doca_comch_server collective_server 03:00.1 cf:00.1 enp3s0f1s0
+-n 1 -host dpu01:1 -x GID_INDEX=1 -x RDB_DISABLE=1 -x AG_PIECE_MAX -x COMM_CORES -x COMPUTE_CORES -x FORCE_STAGING /tmp/build/doca_comch_server collective_server 03:00.0 cf:00.0 enp3s0f0s0
