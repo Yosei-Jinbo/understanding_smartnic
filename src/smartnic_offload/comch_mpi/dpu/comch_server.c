@@ -72,6 +72,14 @@ static int g_force_staging = 0;
  * 経路で通信並列度は効かないため single を採用）。dual-rail コードは残しており、
  * FORCE_SINGLE_RAIL=0 で dual を有効化できる。 */
 static int g_force_single_rail = 1;
+/* RS の Recv 先行 post（pre-post）。1 なら全 step の Recv をループ前に一括 post する。
+ *
+ * これは **チャンク分割とは独立の最適化** である。両者を 1 つのフラグで束ねていた時期があり、
+ * その結果 chunk off（AG_PIECE_MAX=1、および chunk_size < AG_PIECE_MIN_SIZE の小メッセージ）で
+ * 先行 post まで失われ、受信側が recv を post する前に送信が到達して RoCE の RNR リトライが
+ * 発生し、サイズ非依存の固定遅延（実測 ~3ms）が乗っていた。
+ * 既定 1（= main 相当の挙動）。アブレーションで効果を測るときだけ RS_PREPOST=0 にする。 */
+static int g_rs_prepost = 1;
 
 static void core_alloc_init_from_env(void)
 {
@@ -79,17 +87,20 @@ static void core_alloc_init_from_env(void)
     const char *k = getenv("COMPUTE_CORES");
     const char *fs = getenv("FORCE_STAGING");
     const char *sr = getenv("FORCE_SINGLE_RAIL");
+    const char *pp = getenv("RS_PREPOST");
     if (c) { int v = atoi(c); if (v >= 1 && v <= (int)DOCA_WORKER_TYPE_COUNT) g_comm_cores = v; }
     if (k) { int v = atoi(k); if (v >= 1) g_compute_cores = v; }
     g_force_staging = (fs && atoi(fs) != 0) ? 1 : 0;
     /* FORCE_SINGLE_RAIL: 未設定なら既定(1=single)を維持。設定時のみ上書き(0=dual,1=single)。 */
     if (sr) g_force_single_rail = (atoi(sr) != 0) ? 1 : 0;
+    /* RS_PREPOST: 未設定なら既定(1=有効)を維持。設定時のみ上書き。 */
+    if (pp) g_rs_prepost = (atoi(pp) != 0) ? 1 : 0;
     int maxk = 16 - 4 - 2 * g_comm_cores;      /* 2*C + K + 4 <= 16 */
     if (g_compute_cores > maxk) g_compute_cores = maxk;
     if (g_compute_cores < 1)   g_compute_cores = 1;
-    DOCA_LOG_INFO("core alloc: COMM_CORES=%d COMPUTE_CORES=%d (2*C+K+4=%d) FORCE_STAGING=%d FORCE_SINGLE_RAIL=%d",
+    DOCA_LOG_INFO("core alloc: COMM_CORES=%d COMPUTE_CORES=%d (2*C+K+4=%d) FORCE_STAGING=%d FORCE_SINGLE_RAIL=%d RS_PREPOST=%d",
                   g_comm_cores, g_compute_cores, 2 * g_comm_cores + g_compute_cores + 4,
-                  g_force_staging, g_force_single_rail);
+                  g_force_staging, g_force_single_rail, g_rs_prepost);
 }
 
 /* 3 progress worker を C コアに packing（rank 分離） */
@@ -2583,11 +2594,14 @@ static doca_error_t collective_reduce_scatter(
     dpu_union_tracker_enter(false /* is_ag=false for RS */);
 
     /* 全 Ring step の Recv を一括先行 post (AllGather と同じ手法) */
-    /* ---- チャンク分割 + 先行 post（AG_PIECE_MAX で一括 on/off）----
-     * num_pieces>1（チャンク on, AG_PIECE_MAX>1）: 全 step の Recv を piece 単位で一括先行 post し、
-     *   piece の recv 完了ごとに集約（集約を後続 piece の通信と overlap）。
-     * num_pieces==1（チャンク off, AG_PIECE_MAX=1）: 先行 post せず、各 step で Recv をその場で
-     *   post → 完了待ち → 集約（従来の逐次動作）。
+    /* ---- 2 つの独立した最適化 ----
+     *  (1) 先行 post (pre-post): g_rs_prepost (env RS_PREPOST, 既定 1)
+     *      全 step の Recv をループ前に一括 post する。**チャンク分割とは無関係**で、
+     *      off にすると受信 post が送信到達に間に合わず RoCE の RNR リトライで
+     *      サイズ非依存の固定遅延（実測 ~3ms）が乗る。
+     *  (2) チャンク分割 (pipelined): num_pieces > 1 (env AG_PIECE_MAX / AG_PIECE_TARGET)
+     *      piece の recv 完了ごとに集約し、集約を後続 piece の通信と overlap する。
+     *      chunk_size < AG_PIECE_MIN_SIZE(256KB) では num_pieces=1 に落ちる。
      * RS は集約が要素単位なので piece は要素で割り byte サイズを導出（fp16 整列）。 */
     int num_pieces = ag_compute_num_pieces(chunk_size);
     uint64_t elems_per_piece = elements_per_chunk / (uint64_t)num_pieces;
@@ -2595,12 +2609,13 @@ static doca_error_t collective_reduce_scatter(
     uint64_t last_elems = elements_per_chunk - elems_per_piece * (uint64_t)(num_pieces - 1);
     uint64_t piece_size = elems_per_piece * sizeof(fp16_t);        /* bytes (even) */
     uint64_t last_piece_size = last_elems * sizeof(fp16_t);
-    bool pipelined = (num_pieces > 1);
+    /* 集約ループは piece 数でループするため、num_pieces==1 なら自然に逐次動作になる。
+     * （旧実装にあった pipelined フラグは先行 post と束ねていたため廃止した） */
 
     atomic_int recv_pendings[(steps > 0 ? steps : 1) * num_pieces];
 
-    /* チャンク on のときだけ、全 step × piece の Recv を一括先行 post */
-    if (pipelined) {
+    /* 先行 post: num_pieces（チャンク分割の有無）とは独立に、RS_PREPOST=1 なら常に実行 */
+    if (g_rs_prepost) {
         for (int step = 0; step < steps; step++) {
             uint64_t r_idx = (rank + 2*world_size - 2 - step) % world_size;
             for (int p = 0; p < num_pieces; p++) {
@@ -2639,8 +2654,8 @@ static doca_error_t collective_reduce_scatter(
         uint64_t agg_index = (rank + world_size - 1 - (step + 1)) % world_size;
         uint64_t r_idx = (rank + 2*world_size - 2 - step) % world_size;
 
-        /* チャンク off: この step の Recv を今 post（先行 post していないため）*/
-        if (!pipelined) {
+        /* 先行 post 無効時のみ: この step の Recv をここで post する */
+        if (!g_rs_prepost) {
             for (int p = 0; p < num_pieces; p++) {
                 uint64_t p_off = (uint64_t)p * piece_size;
                 uint64_t p_len = (p == num_pieces - 1) ? last_piece_size : piece_size;
