@@ -771,38 +771,53 @@ def main():
 
     value = float(10 ** rank)
 
+    # 環境変数 BENCH_RUN があれば --run を上書き。
+    #   "doca" = DOCA の RS/AG 両方（NCCL を省略）
+    #   "nccl" = NCCL の RS/AG 両方（DOCA を省略）
+    run_sel = os.environ.get("BENCH_RUN", args.run)
+
     # ---- DOCA comch init ----
-    doca_comch_client_pybind.doca_comch_client_init_py(args.server_name, args.pci_addr)
+    # NCCL 単体のベンチ (nccl / nccl_rs / nccl_ag) では DOCA を一切使わないので初期化を省く。
+    # これにより **DPU 側 collective_server の起動が不要** になり、NCCL 設定スイープを
+    # 完全自動で回せる (サーバは切断で finish するため、本来は毎回再起動が要る)。
+    _needs_doca = run_sel in ("doca_rs", "doca_ag", "doca", "all")
+    if _needs_doca:
+        doca_comch_client_pybind.doca_comch_client_init_py(args.server_name, args.pci_addr)
 
-    id0 = 0
-    doca_comch_client_pybind.ucp_connect_host_dpu_request_py(id0)
-    doca_comch_client_pybind.ucp_create_ring_request_py(id0)
-    
-    time.sleep(1)
+        id0 = 0
+        doca_comch_client_pybind.ucp_connect_host_dpu_request_py(id0)
+        doca_comch_client_pybind.ucp_create_ring_request_py(id0)
 
+        time.sleep(1)
+    elif rank == 0:
+        print(f"[INFO] BENCH_RUN={run_sel}: DOCA を使わないため comch 初期化をスキップ (DPU 不要)",
+              flush=True)
 
     # ---- run benchmarks ----
-    # 環境変数 BENCH_RUN があれば --run を上書き。"doca" は DOCA の RS/AG 両方（NCCL を省略）。
-    run_sel = os.environ.get("BENCH_RUN", args.run)
     if run_sel in ("doca_rs", "doca", "all"):
         benchmark_doca_reduce_scatter_flat(device=device, value=value)
 
     if run_sel in ("doca_ag", "doca", "all"):
         benchmark_doca_all_gather_flat(device=device, value=value)
 
-    if run_sel in ("nccl_rs", "all"):
+    if run_sel in ("nccl_rs", "nccl", "all"):
         benchmark_gpu_reduce_scatter_torch(device=device, value=value, rank=rank, world_size=world_size)
 
-    if run_sel in ("nccl_ag", "all"):
+    if run_sel in ("nccl_ag", "nccl", "all"):
         benchmark_gpu_all_gather_torch(device=device, value=value, rank=rank, world_size=world_size)
 
     # ---- finalize ----
     comm.Barrier()
-    if rank == 0:
+    # BENCH_NO_PAUSE=1 で終了時の一時停止を抑止する (スクリプトから連続実行する用)。
+    # mpirun が端末の stdin を rank0 に転送すると、`< /dev/null` を付けても
+    # ここで待ち続けてしまうことがあるため。
+    '''
+    if rank == 0 and os.environ.get("BENCH_NO_PAUSE", "0") != "1":
         try:
             input("Enterキーを押すと続行します...")
         except EOFError:
             print("stdin が接続されていないので、そのまま続行します")
+    '''
 
     comm.Barrier()
     doca_comch_client_pybind.doca_mpi_finalize_py()
