@@ -44,11 +44,13 @@ def main() -> None:
             outfile = f"logs/nsys/profile_{host}_node{node_rank}"
         os.makedirs(os.path.dirname(outfile) or ".", exist_ok=True)
         extra = shlex.split(os.environ.get("NSYS_EXTRA_ARGS", ""))
+        # --trace/--sample/--cpuctxsw は NSYS_EXTRA_ARGS で重複指定すると壊れるため、
+        # ここでは env で上書き可能にする (CPU トレースラン用: NSYS_TRACE=cuda,nvtx,osrt など)。
         cmd = [
             "/usr/local/cuda/bin/nsys", "profile",
-            "--trace=cuda,nvtx",
-            "--sample=none",
-            "--cpuctxsw=none",
+            "--trace=" + os.environ.get("NSYS_TRACE", "cuda,nvtx"),
+            "--sample=" + os.environ.get("NSYS_SAMPLE", "none"),
+            "--cpuctxsw=" + os.environ.get("NSYS_CPUCTXSW", "none"),
             "--capture-range=cudaProfilerApi",
             "--capture-range-end=stop-shutdown",
             "--force-overwrite=true",

@@ -53,9 +53,9 @@ declare -A SIZE_LABEL=( [65536]=64KB [1048576]=1MB [16777216]=16MB )
 # 積み上げ構成: "name|COMM_CORES|COMPUTE_CORES|AG_PIECE_MAX|FORCE_STAGING"
 CONFIGS=(
   "baseline|1|1|1|1"
-  "multicore|3|6|1|1"
-  "chunk|3|6|8|1"
-  "full|3|6|8|0"
+  "multicore|2|8|1|1"
+  "chunk|2|8|8|1"
+  "full|2|8|8|0"
 )
 
 MANUAL_DPU=1
@@ -64,7 +64,7 @@ DPU_DIR="/home/ubuntu/doca_practice/comch_mpi/dpu"
 # -----------------------------------------------------------------------------
 
 mkdir -p "$OUT_DIR"
-echo "config,comm_cores,compute_cores,ag_piece_max,force_staging,coll,N,size_label,avg_ms,p50_ms,p99_ms" > "$CSV"
+echo "config,comm_cores,compute_cores,ag_piece_max,force_staging,coll,N,size_label,avg_ms,p50_ms,p99_ms,bw_gbps" > "$CSV"
 
 restart_dpu() {
   local name=$1 C=$2 K=$3 P=$4 S=$5
@@ -72,14 +72,14 @@ restart_dpu() {
     echo "============================================================"
     echo "[DPU] dpu01 で以下を実行して両 DPU の collective_server を再起動 ($name):"
     echo "  cd $DPU_DIR"
-    echo "  export COMM_CORES=$C COMPUTE_CORES=$K AG_PIECE_MAX=$P FORCE_STAGING=$S"
+    echo "  export COMM_CORES=$C COMPUTE_CORES=$K AG_PIECE_MAX=$P FORCE_STAGING=$S FORCE_SINGLE_RAIL=1"
     echo "  mpirun --app dpu_appfile"
-    echo "  # 起動ログに 'FORCE_STAGING=$S' 'COMM_CORES=$C COMPUTE_CORES=$K' を確認"
+    echo "  # 起動ログに 'FORCE_STAGING=$S' 'FORCE_SINGLE_RAIL=1' 'COMM_CORES=$C COMPUTE_CORES=$K' を確認"
     echo "------------------------------------------------------------"
     read -r -p "DPU が待受状態になったら Enter: " _
   else
     $DPU_SSH_LAUNCHER "pkill -f doca_comch_server; sleep 2; cd $DPU_DIR && \
-      COMM_CORES=$C COMPUTE_CORES=$K AG_PIECE_MAX=$P FORCE_STAGING=$S \
+      COMM_CORES=$C COMPUTE_CORES=$K AG_PIECE_MAX=$P FORCE_STAGING=$S FORCE_SINGLE_RAIL=1 \
       nohup mpirun --app dpu_appfile > /tmp/dpu_${name}.log 2>&1 & sleep 5"
     sleep 5
   fi
@@ -88,7 +88,7 @@ restart_dpu() {
 run_host_bench() {
   local log=$1
   ( cd "$HOST_DIR" && BENCH_RUN=doca BENCH_SIZES="$BENCH_SIZES_CSV" \
-    mpirun --app host_appfile_py < /dev/null ) > "$log" 2>&1
+    mpirun --app host_appfile_py < /dev/null ) 2>&1 | tee "$log"
 }
 
 # ログから [DOCA RS/AG flat] 行を抽出 → "coll,N,avg,p50,p99"
@@ -100,7 +100,8 @@ parse_log() {
       a=$0;  sub(/.*avg=[ ]*/,"",a); sub(/[ ]*ms.*/,"",a);
       p=$0;  sub(/.*p50=[ ]*/,"",p); sub(/[ ]*ms.*/,"",p);
       q=$0;  sub(/.*p99=[ ]*/,"",q); sub(/[ ]*ms.*/,"",q);
-      if (n != "") print coll","n","a","p","q;
+      b=$0;  sub(/.*BW=[ ]*/,"",b); sub(/[ ]*GB.*/,"",b);
+      if (n != "") print coll","n","a","p","q","b;
     }
   ' "$1"
 }
@@ -113,10 +114,10 @@ for cfg in "${CONFIGS[@]}"; do
   restart_dpu "$name" "$C" "$K" "$P" "$S"
   echo "[host] running DOCA AG/RS flat ..."
   run_host_bench "$log"
-  while IFS=, read -r coll n avg p50 p99; do
+  while IFS=, read -r coll n avg p50 p99 bw; do
     [[ -z "$n" ]] && continue
     label="${SIZE_LABEL[$n]:-$n}"
-    echo "$name,$C,$K,$P,$S,$coll,$n,$label,$avg,$p50,$p99" >> "$CSV"
+    echo "$name,$C,$K,$P,$S,$coll,$n,$label,$avg,$p50,$p99,$bw" >> "$CSV"
   done < <(parse_log "$log")
   echo "[host] done → $log"
 done
@@ -151,3 +152,10 @@ END{
   print "    RS の full 行は chunk と同値(CrossGVMI は RS 不作用)。";
 }' "$CSV" 2>/dev/null || echo "(gawk 無し環境では summary スキップ。CSV を参照)"
 echo "========================================================"
+
+# ピボット表（RS/AG × N を行、設定を列）を生成: pivot_<metric>.csv
+if command -v python3 >/dev/null 2>&1; then
+  for m in p50_ms avg_ms bw_gbps; do
+    python3 "$(dirname "$0")/pivot.py" "$CSV" "$m"
+  done
+fi

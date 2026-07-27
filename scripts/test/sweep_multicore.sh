@@ -59,7 +59,7 @@ DPU_DIR="/home/ubuntu/doca_practice/comch_mpi/dpu"
 # -----------------------------------------------------------------------------
 
 mkdir -p "$OUT_DIR"
-echo "comm_cores,compute_cores,coll,N,size_label,avg_ms,p50_ms,p99_ms" > "$CSV"
+echo "comm_cores,compute_cores,coll,N,size_label,avg_ms,p50_ms,p99_ms,bw_gbps" > "$CSV"
 
 # DPU 側で構成 C:K の collective_server を再起動する。
 #   MANUAL_DPU=1: 手順を表示して Enter 待ち（ユーザが dpu01 で実行）。
@@ -70,14 +70,15 @@ restart_dpu() {
     echo "============================================================"
     echo "[DPU] dpu01 で以下を実行し、両 DPU の collective_server を再起動してください:"
     echo "  cd $DPU_DIR"
-    echo "  export COMM_CORES=$C COMPUTE_CORES=$K"
-    echo "  mpirun --app dpu_appfile   # 起動ログに 'core alloc: COMM_CORES=$C COMPUTE_CORES=$K' を確認"
+    echo "  export COMM_CORES=$C COMPUTE_CORES=$K FORCE_STAGING=0 FORCE_SINGLE_RAIL=1 AG_PIECE_MAX=8"
+    echo "  mpirun --app dpu_appfile   # 起動ログに 'COMM_CORES=$C COMPUTE_CORES=$K ... FORCE_SINGLE_RAIL=1' を確認"
     echo "------------------------------------------------------------"
     read -r -p "DPU が起動して待受状態になったら Enter: " _
   else
     # 環境依存。ssh・パス・pkill 対象はサイトに合わせて調整すること。
+    # FORCE_STAGING=0 / FORCE_SINGLE_RAIL=1 / AG_PIECE_MAX=8 を明示（残留 export の漏れ防止）。
     $DPU_SSH_LAUNCHER "pkill -f doca_comch_server; sleep 2; \
-      cd $DPU_DIR && COMM_CORES=$C COMPUTE_CORES=$K \
+      cd $DPU_DIR && COMM_CORES=$C COMPUTE_CORES=$K FORCE_STAGING=0 FORCE_SINGLE_RAIL=1 AG_PIECE_MAX=8 \
       nohup mpirun --app dpu_appfile > /tmp/dpu_${C}_${K}.log 2>&1 & sleep 5"
     sleep 5
   fi
@@ -88,7 +89,7 @@ run_host_bench() {
   local C=$1 K=$2 log=$3
   ( cd "$HOST_DIR" && \
     BENCH_RUN=doca BENCH_SIZES="$BENCH_SIZES_CSV" \
-    mpirun --app host_appfile_py < /dev/null ) > "$log" 2>&1
+    mpirun --app host_appfile_py < /dev/null ) 2>&1 | tee "$log"
 }
 
 # ログから [DOCA RS/AG flat] 行の avg/p50/p99 を抽出 → "coll,N,avg,p50,p99"
@@ -100,7 +101,8 @@ parse_log() {
       a=$0;  sub(/.*avg=[ ]*/,"",a); sub(/[ ]*ms.*/,"",a);
       p=$0;  sub(/.*p50=[ ]*/,"",p); sub(/[ ]*ms.*/,"",p);
       q=$0;  sub(/.*p99=[ ]*/,"",q); sub(/[ ]*ms.*/,"",q);
-      if (n != "") print coll","n","a","p","q;
+      b=$0;  sub(/.*BW=[ ]*/,"",b); sub(/[ ]*GB.*/,"",b);
+      if (n != "") print coll","n","a","p","q","b;
     }
   ' "$1"
 }
@@ -115,10 +117,10 @@ for cfg in "${CONFIGS[@]}"; do
   run_host_bench "$C" "$K" "$log"
 
   # 抽出して CSV 追記
-  while IFS=, read -r coll n avg p50 p99; do
+  while IFS=, read -r coll n avg p50 p99 bw; do
     [[ -z "$n" ]] && continue
     label="${SIZE_LABEL[$n]:-$n}"
-    echo "$C,$K,$coll,$n,$label,$avg,$p50,$p99" >> "$CSV"
+    echo "$C,$K,$coll,$n,$label,$avg,$p50,$p99,$bw" >> "$CSV"
   done < <(parse_log "$log")
   echo "[host] done → $log"
 done
@@ -144,3 +146,10 @@ END{
   }
 }' "$CSV" 2>/dev/null || echo "(summary は gawk が無い環境ではスキップ。CSV を参照)"
 echo "===================================================="
+
+# ピボット表（RS/AG × N を行、設定を列）を生成: pivot_<metric>.csv
+if command -v python3 >/dev/null 2>&1; then
+  for m in p50_ms avg_ms bw_gbps; do
+    python3 "$(dirname "$0")/pivot.py" "$CSV" "$m"
+  done
+fi

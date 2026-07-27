@@ -37,6 +37,24 @@ sys.path.insert(0, str(COMCH_HOST_DIR))
 import doca_comch_client_pybind
 from doca_comch_client_pybind import CollectiveCommunication
 
+# ---- 転送内訳計測用 NVTX (XFER_NVTX=1 で有効) ----
+# nsys の memcpy を NVTX 区間へ射影して「1step あたりの転送時間」を内訳付きで取るための計装。
+# scripts/extract_transfer_per_step.py が 'xfer:*' 区間を参照する。
+# per-submodule の USE_NVTX_RANGES とは独立にゲートする (単独で on にできるようにするため)。
+_XFER_NVTX = os.environ.get("XFER_NVTX", "0") == "1"
+
+
+def _xfer_push(label: str) -> None:
+    if _XFER_NVTX:
+        torch.cuda.nvtx.range_push(label)
+
+
+def _xfer_pop() -> None:
+    if _XFER_NVTX:
+        torch.cuda.nvtx.range_pop()
+
+
+
 # ------------------------------------------------------------
 # CPU<->GPU copy time accounting (CUDA event based)
 #   - We accumulate per-rank GPU time (ms) for:
@@ -1209,12 +1227,21 @@ class ZeroOptimizer3(object):
             if same_buffer:
                 pass  # RS出力が直接grad_bufferに書き込まれている: コピー不要
             elif self.micro_step_id == 0:
-                grad_buffer.copy_(grad_partition, non_blocking=True)
+                # D2H の時間は NVTX 区間 'xfer:grad_d2h' の memcpy 射影 (nsys) で取得する。
+                _xfer_push("xfer:grad_d2h")
+                try:
+                    grad_buffer.copy_(grad_partition, non_blocking=True)
+                finally:
+                    _xfer_pop()
             else:
                 if grad_buffer.device != grad_partition.device:
                     cuda_grad_buffer = grad_buffer.to(grad_partition.device, non_blocking=True)
                     cuda_grad_buffer.add_(grad_partition)
-                    grad_buffer.copy_(cuda_grad_buffer, non_blocking=True)
+                    _xfer_push("xfer:grad_d2h")
+                    try:
+                        grad_buffer.copy_(cuda_grad_buffer, non_blocking=True)
+                    finally:
+                        _xfer_pop()
                     grad_buffer = cuda_grad_buffer
                 else:
                     grad_buffer.add_(grad_partition)
@@ -1232,7 +1259,11 @@ class ZeroOptimizer3(object):
                 offload_fp32_offsets = {}
                 if self.is_gradient_accumulation_boundary:
                     fp32_grad_tensor = self.fp32_grad_bufs[self.grad_buf_switch][i].narrow(0, dest_offset, grad_buffer.numel())
-                    fp32_grad_tensor.copy_(grad_buffer)
+                    _xfer_push("xfer:grad_d2h")
+                    try:
+                        fp32_grad_tensor.copy_(grad_buffer)  # fp16 grad -> fp32 grad buf
+                    finally:
+                        _xfer_pop()
                 
             param.grad.record_stream(torch.cuda.current_stream())
             param.grad = None

@@ -10,6 +10,24 @@ from stage3_utils import * #parameterの持ち方が違うため独自のmemory_
 from common import submodule_timing as smt
 import time
 
+# ---- 転送内訳計測用 NVTX (XFER_NVTX=1 で有効) ----
+# nsys の memcpy を NVTX 区間へ射影して「1step あたりの転送時間」を内訳付きで取るための計装。
+# scripts/extract_transfer_per_step.py が 'xfer:*' 区間を参照する。
+# per-submodule の USE_NVTX_RANGES とは独立にゲートする (単独で on にできるようにするため)。
+_XFER_NVTX = os.environ.get("XFER_NVTX", "0") == "1"
+
+
+def _xfer_push(label: str) -> None:
+    if _XFER_NVTX:
+        torch.cuda.nvtx.range_push(label)
+
+
+def _xfer_pop() -> None:
+    if _XFER_NVTX:
+        torch.cuda.nvtx.range_pop()
+
+
+
 # ---- NVTX per-submodule ranges (USE_NVTX_RANGES=1 で有効) ----
 # nsys profile + `nsys stats --report nvtxkernsum` で
 # fwd:<name>, fwd_fetch:<name>, fwd_exec:<name>, bwd:<name>, bwd_fetch:<name>, bwd_exec:<name>
@@ -529,7 +547,11 @@ class ZeroOffload(object):
                     cpu_full = self._ensure_pinned_cpu_full_param(param)
                     # GPU → pinned CPU への非同期コピー（DMA）
                     # 後で CPU から読む前にどこかで同期されていればOK
-                    cpu_full.copy_(param.data, non_blocking=True)
+                    _xfer_push("xfer:full_param_d2h")
+                    try:
+                        cpu_full.copy_(param.data, non_blocking=True)
+                    finally:
+                        _xfer_pop()
                     # param.cpu_full_param はずっと保持して再利用する
         '''
         ブロッキング通信

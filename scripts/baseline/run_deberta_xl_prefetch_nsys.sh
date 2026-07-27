@@ -4,17 +4,23 @@
 
 NODE_RANK=${1:?Usage: $0 <node_rank: 0=bluefield01, 1=bluefield02>}
 
+# NCCL は「真のデフォルト」で測る。対話シェルに残った export が torchrun に漏れるのを防ぐ。
+unset NCCL_ALGO NCCL_PROTO
+
 mkdir -p logs/nsys
 
 export NSYS_OUTPUT_BASE="logs/nsys/deberta_xl_buf_prefetch"
+export NSYS_EXTRA_ARGS="--gpu-metrics-devices=0 --gpu-metrics-frequency=10000 --gpu-metrics-set=ga10x"
 
 ENABLE_FULL_PARAM_TRANSFER=0 \
 USE_NVTX_RANGES=0 \
+XFER_NVTX=1 \
 DISABLE_COMPLETION_POLLER=1 \
 DISABLE_ADAM_FORK=1 \
 NSYS_PROFILE_MEASURE_ITERS=25 \
 NSYS_SYNC_RANGES=1 \
 NCCL_SOCKET_IFNAME=enp207s0f0np0,enp207s0f1np1 \
+NCCL_IB_DISABLE=0 \
 NCCL_NET_GDR_LEVEL=SYS \
 NCCL_P2P_LEVEL=SYS \
 NCCL_CUMEM_ENABLE=0 \

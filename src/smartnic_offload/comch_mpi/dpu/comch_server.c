@@ -68,20 +68,28 @@ static int g_compute_cores = COMPUTE_CORES_DEFAULT;
  * host_dst_rmem/host_src_rmem 経由の RDMA staging 経路に落とす（gpu_direct を強制 off）。
  * RS には影響させない（RS は reduction のため常に DPU に取り込むので staging の概念が無い）。 */
 static int g_force_staging = 0;
+/* AG の rail 選択。既定は single-rail（実測で dual≈single、律速は DPU↔GPU の cross-GVMI DMA
+ * 経路で通信並列度は効かないため single を採用）。dual-rail コードは残しており、
+ * FORCE_SINGLE_RAIL=0 で dual を有効化できる。 */
+static int g_force_single_rail = 1;
 
 static void core_alloc_init_from_env(void)
 {
     const char *c = getenv("COMM_CORES");
     const char *k = getenv("COMPUTE_CORES");
     const char *fs = getenv("FORCE_STAGING");
+    const char *sr = getenv("FORCE_SINGLE_RAIL");
     if (c) { int v = atoi(c); if (v >= 1 && v <= (int)DOCA_WORKER_TYPE_COUNT) g_comm_cores = v; }
     if (k) { int v = atoi(k); if (v >= 1) g_compute_cores = v; }
     g_force_staging = (fs && atoi(fs) != 0) ? 1 : 0;
+    /* FORCE_SINGLE_RAIL: 未設定なら既定(1=single)を維持。設定時のみ上書き(0=dual,1=single)。 */
+    if (sr) g_force_single_rail = (atoi(sr) != 0) ? 1 : 0;
     int maxk = 16 - 4 - 2 * g_comm_cores;      /* 2*C + K + 4 <= 16 */
     if (g_compute_cores > maxk) g_compute_cores = maxk;
     if (g_compute_cores < 1)   g_compute_cores = 1;
-    DOCA_LOG_INFO("core alloc: COMM_CORES=%d COMPUTE_CORES=%d (2*C+K+4=%d) FORCE_STAGING=%d",
-                  g_comm_cores, g_compute_cores, 2 * g_comm_cores + g_compute_cores + 4, g_force_staging);
+    DOCA_LOG_INFO("core alloc: COMM_CORES=%d COMPUTE_CORES=%d (2*C+K+4=%d) FORCE_STAGING=%d FORCE_SINGLE_RAIL=%d",
+                  g_comm_cores, g_compute_cores, 2 * g_comm_cores + g_compute_cores + 4,
+                  g_force_staging, g_force_single_rail);
 }
 
 /* 3 progress worker を C コアに packing（rank 分離） */
@@ -2575,18 +2583,42 @@ static doca_error_t collective_reduce_scatter(
     dpu_union_tracker_enter(false /* is_ag=false for RS */);
 
     /* 全 Ring step の Recv を一括先行 post (AllGather と同じ手法) */
-    atomic_int recv_pendings[steps > 0 ? steps : 1];
-    for (int step = 0; step < steps; step++) {
-        uint64_t r_idx = (rank + 2*world_size - 2 - step) % world_size;
-        atomic_init(&recv_pendings[step], 1);
-        init_ring_recv_task(&task, (void *)((uintptr_t)recv_buf + r_idx * chunk_size),
-                            chunk_size, &cw->rdma_ring_recv, step);
-        task.inline_pending = &recv_pendings[step];
-        task.pe_spin = &cw->ring_recv_pe_spin;
-        submit_doca_task_from_desc(&cw->rdma_ring_recv, &task, NULL);
+    /* ---- チャンク分割 + 先行 post（AG_PIECE_MAX で一括 on/off）----
+     * num_pieces>1（チャンク on, AG_PIECE_MAX>1）: 全 step の Recv を piece 単位で一括先行 post し、
+     *   piece の recv 完了ごとに集約（集約を後続 piece の通信と overlap）。
+     * num_pieces==1（チャンク off, AG_PIECE_MAX=1）: 先行 post せず、各 step で Recv をその場で
+     *   post → 完了待ち → 集約（従来の逐次動作）。
+     * RS は集約が要素単位なので piece は要素で割り byte サイズを導出（fp16 整列）。 */
+    int num_pieces = ag_compute_num_pieces(chunk_size);
+    uint64_t elems_per_piece = elements_per_chunk / (uint64_t)num_pieces;
+    if (elems_per_piece == 0) { num_pieces = 1; elems_per_piece = elements_per_chunk; }
+    uint64_t last_elems = elements_per_chunk - elems_per_piece * (uint64_t)(num_pieces - 1);
+    uint64_t piece_size = elems_per_piece * sizeof(fp16_t);        /* bytes (even) */
+    uint64_t last_piece_size = last_elems * sizeof(fp16_t);
+    bool pipelined = (num_pieces > 1);
+
+    atomic_int recv_pendings[(steps > 0 ? steps : 1) * num_pieces];
+
+    /* チャンク on のときだけ、全 step × piece の Recv を一括先行 post */
+    if (pipelined) {
+        for (int step = 0; step < steps; step++) {
+            uint64_t r_idx = (rank + 2*world_size - 2 - step) % world_size;
+            for (int p = 0; p < num_pieces; p++) {
+                uint64_t p_off = (uint64_t)p * piece_size;
+                uint64_t p_len = (p == num_pieces - 1) ? last_piece_size : piece_size;
+                int ri = step * num_pieces + p;
+                atomic_init(&recv_pendings[ri], 1);
+                init_ring_recv_task(&task,
+                    (void *)((uintptr_t)recv_buf + r_idx * chunk_size + p_off),
+                    p_len, &cw->rdma_ring_recv, ri);
+                task.inline_pending = &recv_pendings[ri];
+                task.pe_spin = &cw->ring_recv_pe_spin;
+                submit_doca_task_from_desc(&cw->rdma_ring_recv, &task, NULL);
+            }
+        }
     }
 
-    /* Read[0]: chunk[(rank-1)%ws] from GPU src → send_buf */
+    /* Read[0]: chunk[(rank-1)%ws] from GPU src → send_buf (chunk 一括) */
     #define RS_INLINE_READ(idx) do { \
         uint64_t _off = (idx) * chunk_size; \
         atomic_int _p; atomic_init(&_p, 1); \
@@ -2604,16 +2636,39 @@ static doca_error_t collective_reduce_scatter(
 
     for (int step = 0; step < steps; step++) {
         uint64_t s_idx = (rank + world_size - 1 - step) % world_size;
+        uint64_t agg_index = (rank + world_size - 1 - (step + 1)) % world_size;
+        uint64_t r_idx = (rank + 2*world_size - 2 - step) % world_size;
 
-        /* Send (inline) — Recv は既に pre-post 済み */
+        /* チャンク off: この step の Recv を今 post（先行 post していないため）*/
+        if (!pipelined) {
+            for (int p = 0; p < num_pieces; p++) {
+                uint64_t p_off = (uint64_t)p * piece_size;
+                uint64_t p_len = (p == num_pieces - 1) ? last_piece_size : piece_size;
+                int ri = step * num_pieces + p;
+                atomic_init(&recv_pendings[ri], 1);
+                init_ring_recv_task(&task,
+                    (void *)((uintptr_t)recv_buf + r_idx * chunk_size + p_off),
+                    p_len, &cw->rdma_ring_recv, ri);
+                task.inline_pending = &recv_pendings[ri];
+                task.pe_spin = &cw->ring_recv_pe_spin;
+                submit_doca_task_from_desc(&cw->rdma_ring_recv, &task, NULL);
+            }
+        }
+
+        /* Send を piece ごとに post */
         atomic_int send_p;
-        atomic_init(&send_p, 1);
-        init_ring_send_task(&task, (void *)((uintptr_t)send_buf + s_idx * chunk_size),
-                            chunk_size, &cw->rdma_ring_send, cw->conn_to_next, step);
-        task.inline_pending = &send_p; task.pe_spin = &cw->ring_send_pe_spin;
-        submit_doca_task_from_desc(&cw->rdma_ring_send, &task, NULL);
+        atomic_init(&send_p, num_pieces);
+        for (int p = 0; p < num_pieces; p++) {
+            uint64_t p_off = (uint64_t)p * piece_size;
+            uint64_t p_len = (p == num_pieces - 1) ? last_piece_size : piece_size;
+            init_ring_send_task(&task,
+                (void *)((uintptr_t)send_buf + s_idx * chunk_size + p_off),
+                p_len, &cw->rdma_ring_send, cw->conn_to_next, step);
+            task.inline_pending = &send_p; task.pe_spin = &cw->ring_send_pe_spin;
+            submit_doca_task_from_desc(&cw->rdma_ring_send, &task, NULL);
+        }
 
-        /* Read next chunk — Send+Recv と並行 */
+        /* Read next chunk (chunk 一括) — Send/Recv と並行 */
         read_index = (rank - step - 2 + 2*world_size) % world_size;
         atomic_int read_p;
         atomic_init(&read_p, 1);
@@ -2626,23 +2681,35 @@ static doca_error_t collective_reduce_scatter(
             submit_doca_task_from_desc(&cw->rdma_rma, &task, NULL);
         }
 
-        /* Send + Recv + Read 全完了待ち */
-        while (atomic_load_explicit(&recv_pendings[step], memory_order_acquire) > 0 ||
-               atomic_load_explicit(&send_p, memory_order_acquire) > 0 ||
-               atomic_load_explicit(&read_p, memory_order_acquire) > 0) {
+        /* Read(自チャンクの GPU 読み)を先に完了させる: read_index == agg_index で
+         * 集約のベース(send_buf[agg_index])になるため、集約より前に完了必須。 */
+        while (atomic_load_explicit(&read_p, memory_order_acquire) > 0) {
             progress_ring_pes(cw, false);
             progress_rma_pes(cw, false);
         }
 
-        /* Aggregate: send_buf += recv_buf */
-        uint64_t agg_index = (rank + world_size - 1 - (step + 1)) % world_size;
-        uint64_t start = elements_per_chunk * agg_index;
-        uint64_t end = start + elements_per_chunk;
-        if (elements_per_chunk <= RS_AGGREGATION_THRESHOLD / sizeof(fp16_t)) {
-            rs_add_range_neon(local_send_buffer, local_receive_buffer, start, end);
-        } else {
-            submit_rs_task(cw->rs_pool, local_send_buffer, local_receive_buffer, start, end, step);
-            poll_wait_rs_completion(cw->rs_pool, step);
+        /* Aggregate: piece p の Recv 完了を待って集約 */
+        for (int p = 0; p < num_pieces; p++) {
+            int ri = step * num_pieces + p;
+            while (atomic_load_explicit(&recv_pendings[ri], memory_order_acquire) > 0) {
+                progress_ring_pes(cw, false);
+                progress_rma_pes(cw, false);
+            }
+            uint64_t p_elems = (p == num_pieces - 1) ? last_elems : elems_per_piece;
+            uint64_t start = elements_per_chunk * agg_index + (uint64_t)p * elems_per_piece;
+            uint64_t end = start + p_elems;
+            if (p_elems <= RS_AGGREGATION_THRESHOLD / sizeof(fp16_t)) {
+                rs_add_range_neon(local_send_buffer, local_receive_buffer, start, end);
+            } else {
+                submit_rs_task(cw->rs_pool, local_send_buffer, local_receive_buffer, start, end, ri);
+                poll_wait_rs_completion(cw->rs_pool, ri);
+            }
+        }
+
+        /* Send 完了待ち（Recv/Read は上で完了済み）*/
+        while (atomic_load_explicit(&send_p, memory_order_acquire) > 0) {
+            progress_ring_pes(cw, false);
+            progress_rma_pes(cw, false);
         }
     }
 
@@ -2799,6 +2866,12 @@ static doca_error_t collective_all_gather(
         /* full_gpu_direct (src も使う) なら src 側 rail1 も必須 */
         if (gpu_src_local_mmap && !gpu_direct_dual_ring_src_ok)
             use_dual_ring = false;
+    }
+
+    /* rail スケーリング比較テスト: FORCE_SINGLE_RAIL=1 で dual-rail を強制 off（AG のみ）。 */
+    if (g_force_single_rail) {
+        use_dual = false;
+        use_dual_ring = false;
     }
 
     /* ---- Phase 7 Step 0: timing (no print in hot path) ---- */

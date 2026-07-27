@@ -1043,12 +1043,6 @@ def run_zero(use_profiler=False, use_bf16=False, use_ema=False,
                 except Exception:
                     pass
 
-                # COMCH profiling stats (host worker/poller)
-                try:
-                    doca_comch_client_pybind.comch_print_profiling_stats_py()
-                except Exception:
-                    pass
-
                 # update prev for next epoch
                 prev_rs_ms = cur_rs_ms
                 prev_rs_calls, prev_ag_calls, prev_fp_calls = cur_rs_calls, cur_ag_calls, cur_fp_calls

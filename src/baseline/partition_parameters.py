@@ -22,6 +22,24 @@ from torch.nn import Parameter
 import torch.distributed as dist
 from stage3_utils import * #parameterの持ち方が違うため独自のmemory_usage関数を呼ぶ
 
+# ---- 転送内訳計測用 NVTX (XFER_NVTX=1 で有効) ----
+# nsys の memcpy を NVTX 区間へ射影して「1step あたりの転送時間」を内訳付きで取るための計装。
+# scripts/extract_transfer_per_step.py が 'xfer:*' 区間を参照する。
+# per-submodule の USE_NVTX_RANGES とは独立にゲートする (単独で on にできるようにするため)。
+_XFER_NVTX = os.environ.get("XFER_NVTX", "0") == "1"
+
+
+def _xfer_push(label: str) -> None:
+    if _XFER_NVTX:
+        torch.cuda.nvtx.range_push(label)
+
+
+def _xfer_pop() -> None:
+    if _XFER_NVTX:
+        torch.cuda.nvtx.range_pop()
+
+
+
 # ---- Completion poller gate (CUPTI/nsys との衝突回避用) ----
 # DISABLE_COMPLETION_POLLER=1 で _NcclCompletionPoller の使用を抑止する。
 # _NcclCompletionPoller は別スレッドから cudaEventQuery を高頻度に叩くため、
@@ -792,7 +810,11 @@ class CPUAllGatherCoalescedHandle:
                     )
 
                 # CPU -> GPU に復元（local_device か param.device に合わせる）
-                full_gpu = cpu_full.to(self.__device, non_blocking=True)
+                _xfer_push("xfer:full_param_h2d")
+                try:
+                    full_gpu = cpu_full.to(self.__device, non_blocking=True)
+                finally:
+                    _xfer_pop()
                 full_gpu = full_gpu.view(p.ds_shape)
 
                 p.data = full_gpu
@@ -988,7 +1010,12 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                 _st = torch.cuda.Event(enable_timing=True)
                 _ed = torch.cuda.Event(enable_timing=True)
                 _st.record()
-                shard_cuda = param.ds_tensor.to(_local_dev, non_blocking=True)
+                # H2D の内訳は NVTX 区間 'xfer:param_shard_h2d' の memcpy 射影 (nsys) で取得する。
+                _xfer_push("xfer:param_shard_h2d")
+                try:
+                    shard_cuda = param.ds_tensor.to(_local_dev, non_blocking=True)
+                finally:
+                    _xfer_pop()
                 _ed.record()
 
                 # elapsed_time を取るには完了待ちが必要（ここで 1 回だけ同期）
@@ -1034,8 +1061,13 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                     _st = torch.cuda.Event(enable_timing=True)
                     _ed = torch.cuda.Event(enable_timing=True)
                     _st.record()
-                    _tmp = _p.ds_tensor.to("cpu", non_blocking=True)
-                    _tmp = _p.ds_tensor.to(_local_dev, non_blocking=True)
+                    # H2D の内訳は NVTX 区間 'xfer:param_shard_h2d' の memcpy 射影 (nsys) で取得する。
+                    _xfer_push("xfer:param_shard_h2d")
+                    try:
+                        _tmp = _p.ds_tensor.to("cpu", non_blocking=True)
+                        _tmp = _p.ds_tensor.to(_local_dev, non_blocking=True)
+                    finally:
+                        _xfer_pop()
                     _ed.record()
                     _ev_pairs.append((_st, _ed))
                     _shards.append(_tmp)
