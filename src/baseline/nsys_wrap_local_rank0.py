@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
-"""torchrun 用の nsys ラッパ: LOCAL_RANK==0 の process だけ nsys profile で再 exec する。
+"""[非推奨] torchrun 用の nsys ラッパ: LOCAL_RANK==0 の process だけ nsys profile で再 exec する。
+
+**このファイルは使わないこと。** scripts/smartnic_offload/nsys_wrap.sh に統一済み。
+
+非推奨の理由 (2026-07-28):
+  1. LOCAL_RANK==0 しか包まないため、4 ランク中 2 ランクしかレポートが取れない。
+  2. --capture-range-end=stop-shutdown を使っている。これは cudaProfilerStop() の
+     瞬間に対象アプリを強制終了するため、複数ランクを包むと
+     「最初に到達したランクが死ぬ → 残りが集団通信で待つ → mpirun/torchrun が
+     ジョブ全体を SIGKILL → 書き出し中の nsys が道連れ」となる。
+  3. 下記 docstring の「CUPTI 同居 SIGSEGV」という設計前提は、2026-07-28 に
+     4 ランク同時 profiling が成功したことで否定された。
+
+以下は歴史的経緯としての元の説明。
+
 
 背景:
   `nsys profile torchrun --nproc_per_node=N ...` のように nsys が torchrun を包むと、

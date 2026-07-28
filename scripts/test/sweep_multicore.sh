@@ -40,6 +40,7 @@ OUT_DIR=/home/y-jinbo/understanding_smartnic/logs/sweep_multicore
 CSV="$OUT_DIR/results.csv"
 
 # 振る構成: "C K"（通信コア数 計算コア数）
+# 1 4は計算コア 1x4 + 4 + 4 = 12
 CONFIGS=(
   "3 6"
   "2 6"
@@ -63,7 +64,7 @@ echo "comm_cores,compute_cores,coll,N,size_label,avg_ms,p50_ms,p99_ms,bw_gbps" >
 
 # DPU 側で構成 C:K の collective_server を再起動する。
 #   MANUAL_DPU=1: 手順を表示して Enter 待ち（ユーザが dpu01 で実行）。
-#   MANUAL_DPU=0: SSH で kill→env→mpirun をバックグラウンド起動（環境依存・要調整）。
+#   MANUAL_DPU=0: SSH で kill→env→mpirun --bind-to noneをバックグラウンド起動（環境依存・要調整）。
 restart_dpu() {
   local C=$1 K=$2
   if [[ "$MANUAL_DPU" == "1" ]]; then
@@ -71,7 +72,7 @@ restart_dpu() {
     echo "[DPU] dpu01 で以下を実行し、両 DPU の collective_server を再起動してください:"
     echo "  cd $DPU_DIR"
     echo "  export COMM_CORES=$C COMPUTE_CORES=$K FORCE_STAGING=0 FORCE_SINGLE_RAIL=1 AG_PIECE_MAX=8"
-    echo "  mpirun --app dpu_appfile   # 起動ログに 'COMM_CORES=$C COMPUTE_CORES=$K ... FORCE_SINGLE_RAIL=1' を確認"
+    echo "  mpirun --bind-to none --app dpu_appfile   # 起動ログに 'COMM_CORES=$C COMPUTE_CORES=$K ... FORCE_SINGLE_RAIL=1' を確認"
     echo "------------------------------------------------------------"
     read -r -p "DPU が起動して待受状態になったら Enter: " _
   else
@@ -79,7 +80,7 @@ restart_dpu() {
     # FORCE_STAGING=0 / FORCE_SINGLE_RAIL=1 / AG_PIECE_MAX=8 を明示（残留 export の漏れ防止）。
     $DPU_SSH_LAUNCHER "pkill -f doca_comch_server; sleep 2; \
       cd $DPU_DIR && COMM_CORES=$C COMPUTE_CORES=$K FORCE_STAGING=0 FORCE_SINGLE_RAIL=1 AG_PIECE_MAX=8 \
-      nohup mpirun --app dpu_appfile > /tmp/dpu_${C}_${K}.log 2>&1 & sleep 5"
+      nohup mpirun --bind-to none --app dpu_appfile > /tmp/dpu_${C}_${K}.log 2>&1 & sleep 5"
     sleep 5
   fi
 }
@@ -89,7 +90,7 @@ run_host_bench() {
   local C=$1 K=$2 log=$3
   ( cd "$HOST_DIR" && \
     BENCH_RUN=doca BENCH_SIZES="$BENCH_SIZES_CSV" \
-    mpirun --app host_appfile_py < /dev/null ) 2>&1 | tee "$log"
+    mpirun --bind-to none --app host_appfile_py < /dev/null ) 2>&1 | tee "$log"
 }
 
 # ログから [DOCA RS/AG flat] 行の avg/p50/p99 を抽出 → "coll,N,avg,p50,p99"

@@ -44,6 +44,23 @@ if not logger.handlers:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 
+# ---- ステップ内訳 NVTX (STEP_NVTX=1 で有効) ----
+# compute_idle_decomp の "Other"(=host_overhead) に丸め込まれている区間を細分するための計装。
+# 査読 C3「Fig.7 の Other を SM 競合緩和とホスト/起動オーバーヘッドに分離できるか」に対応。
+# xfer: 系 (XFER_NVTX) とは独立にゲートする。
+_STEP_NVTX = os.environ.get("STEP_NVTX", "0") == "1"
+
+
+def _step_push(label: str) -> None:
+    if _STEP_NVTX:
+        torch.cuda.nvtx.range_push(label)
+
+
+def _step_pop() -> None:
+    if _STEP_NVTX:
+        torch.cuda.nvtx.range_pop()
+
+
 def print_rank_0(message: str):
     if dist.is_initialized():
         if dist.get_rank() == 0:
@@ -386,6 +403,7 @@ def run_zero(use_profiler=False, use_bf16=False, use_ema=False,
              reduce_bucket_size=int(1e8), prefetch_bucket_size=int(1e8),
              max_reuse_distance=0, max_live_parameters=int(1.5e8)):
     profiler = None
+    zero_model = None
     try:
         local_rank, rank, world_size = setup_from_env()
         comm = MPI.COMM_WORLD
@@ -827,6 +845,12 @@ def run_zero(use_profiler=False, use_bf16=False, use_ema=False,
                     # nsys --capture-range=cudaProfilerApi 用: warmup 完了時にキャプチャ開始
                     if total_target_iters is not None and global_iter == WARMUP_STEPS:
                         torch.cuda.synchronize()
+                        # 全ランク profiling では、ランク間の到達スキュー (実測で最大 741ms) が
+                        # そのままキャプチャ窓のズレになり、「誰が誰を待っているか」を
+                        # タイムライン上で突き合わせられなくなる。窓の開始を揃える。
+                        # NCCL ではなく MPI barrier を使うのは、窓の端に NCCL カーネルを
+                        # 混入させないため。
+                        comm.Barrier()
                         torch.cuda.profiler.start()
 
                     # debug step counter
@@ -874,12 +898,21 @@ def run_zero(use_profiler=False, use_bf16=False, use_ema=False,
 
                         timers("opt_dpu").start()
                         t0 = time.perf_counter()
-                        boundary_flag = zero_model.step_dpu()
+                        _step_push("step:opt_dpu")
+                        try:
+                            boundary_flag = zero_model.step_dpu()
+                        finally:
+                            _step_pop()
                         timers("opt_dpu").stop()
                         _record_step_time("opt_dpu", time.perf_counter() - t0)
 
                         # rank 間同期: forward 開始を揃えて AG の DPU MPI_Barrier 待ちを削減
-                        dist.barrier()
+                        # 測定区間内にあるため、Other から分離できるよう NVTX で括る
+                        _step_push("step:barrier")
+                        try:
+                            dist.barrier()
+                        finally:
+                            _step_pop()
 
                         _pp.set_ag_phase("forward")
                         timers("fwd").start()
@@ -907,7 +940,11 @@ def run_zero(use_profiler=False, use_bf16=False, use_ema=False,
                         _pp.set_ag_phase("unknown")
 
                         if boundary_flag:
-                            zero_model.optimizer.update_new_params()
+                            _step_push("step:update_new_params")
+                            try:
+                                zero_model.optimizer.update_new_params()
+                            finally:
+                                _step_pop()
 
                     _record_step_time("step_total", time.perf_counter() - step_t0)
                     global_step_count += 1
@@ -918,6 +955,7 @@ def run_zero(use_profiler=False, use_bf16=False, use_ema=False,
                     # NSYS_PROFILE_MEASURE_ITERS で早めに切って末尾の hang を回避できる
                     if total_target_iters is not None and global_iter == _nsys_profile_end_iter:
                         torch.cuda.synchronize()
+                        comm.Barrier()  # キャプチャ窓の終端も揃える (start 側と対)
                         torch.cuda.profiler.stop()
                     if total_target_iters is not None and global_iter >= total_target_iters:
                         print_rank_0(f"Reached target iterations ({global_iter}/{total_target_iters}), stopping.")
@@ -1156,7 +1194,13 @@ def run_zero(use_profiler=False, use_bf16=False, use_ema=False,
     finally:
         if profiler and hasattr(profiler, "stop"):
             profiler.stop()
-        zero_model.stop_adam_process()
+        # 初期化途中 (例: model.to(device) の CUDA OOM) で抜けると zero_model は未生成。
+        # ここで例外を投げると元の例外が握り潰され、真因が追えなくなる。
+        if zero_model is not None:
+            try:
+                zero_model.stop_adam_process()
+            except Exception as _e:
+                print(f"[warn] stop_adam_process failed: {_e}", flush=True)
         cleanup()
 
 
