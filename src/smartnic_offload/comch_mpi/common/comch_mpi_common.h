@@ -18,7 +18,6 @@
 #include <doca_error.h>
 
 #include "common.h"
-#include "rdma_common.h"
 
 #define DOCA_CHECK(expr)                                     \
     do {                                                     \
@@ -29,7 +28,6 @@
         }                                                    \
     } while (0)
 
-//コマンド長は64バイトとしている(少なかったら増やして)
 #define CONTROL_CMD_MAX_SIZE  4096
 #define CONTROL_NOTIFY_MAX_SIZE 4096
 
@@ -243,7 +241,6 @@ static inline doca_error_t  control_cmd_pack(struct control_cmd *cmd, size_t *pa
     size_t pack_len;
 
     pack_len = control_cmd_packed_len(cmd);
-    //printf("in control cmd pack: pack_len=%lu, packed_cmd_len=%lu\n",pack_len, *packed_cmd_len);
     if(pack_len > *packed_cmd_len)
         return DOCA_ERROR_INITIALIZATION;
 
@@ -525,7 +522,6 @@ static inline doca_error_t control_cmd_unpack(void *packed_cmd, size_t packed_cm
 
 //DPU -> ホストに返す用の構造体 (扱いは cmd と同形だが、現在は RDMA で通知を書くため使用箇所は限定)
 enum control_notify_type {
-    //CONTROL_NOTIFY_RDMA_CONNECT_HOST_DPU,
     CONTROL_NOTIFY_UCP_CONNECT_HOST_DPU,
     CONTROL_NOTIFY_UCP_CREATE_RING,
     CONTROL_NOTIFY_UCP_COLLECTIVE,

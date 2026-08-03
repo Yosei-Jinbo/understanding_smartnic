@@ -114,10 +114,12 @@ def debug_extract_module_and_param_names(model):
 class ZeroWrapperExample(Module):
     def __init__(self, model, optimizer, model_parameters, dist_init_required=None,
                  reduce_bucket_size=int(1e8), prefetch_bucket_size=int(1e8),
-                 max_reuse_distance=0, max_live_parameters=int(1.5e8)):
+                 max_reuse_distance=0, max_live_parameters=int(1.5e8),
+                 offload=True):
         super().__init__()
         self.client_optimizer = optimizer
         self.client_model_parameter = model_parameters
+        self._offload = offload  # False: 純粋な ZeRO-3 (GPU 常駐, in-process Adam)
         self._reduce_bucket_size = int(reduce_bucket_size)
         self._prefetch_bucket_size = int(prefetch_bucket_size)
         self._max_reuse_distance = int(max_reuse_distance)
@@ -291,7 +293,8 @@ class ZeroWrapperExample(Module):
             overlap_comm=self.overlap_comm,
             sub_group_size=self.sub_group_size,
             gradient_accumulation_steps=self.gradient_accumulation_steps,
-            communication_data_type=self.communication_data_type
+            communication_data_type=self.communication_data_type,
+            offload=self._offload
         )
         return optimizer
     

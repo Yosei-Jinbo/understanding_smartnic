@@ -1064,7 +1064,9 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                     # H2D の内訳は NVTX 区間 'xfer:param_shard_h2d' の memcpy 射影 (nsys) で取得する。
                     _xfer_push("xfer:param_shard_h2d")
                     try:
-                        _tmp = _p.ds_tensor.to("cpu", non_blocking=True)
+                        # 注: ds_tensor が既に GPU 常駐 (--no-offload) の場合 .to() は no-op。
+                        # 以前ここに .to("cpu") のデッドストアがあり、ZeRO-3 で全シャードを
+                        # 毎 AG ごとに GPU→CPU へ無駄コピーしていた (2026-07-29 削除)。
                         _tmp = _p.ds_tensor.to(_local_dev, non_blocking=True)
                     finally:
                         _xfer_pop()

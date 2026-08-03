@@ -196,17 +196,19 @@ class ZeroOffload(object):
                  #max_reuse_distance=1000000000,
                  max_reuse_distance=0,
                  #max_live_parameters=1000000000
-                 max_live_parameters=0):
-        
+                 max_live_parameters=0,
+                 offload_param=True):
+
         see_memory_usage("ZeRoOffload initialize [begin]", force=True)
         print_rank_0(f"initialized {__class__.__name__} with args: {locals()}", force=False)
-        
+
         self.module = module
         attach_module_names(self.module)
         self.dtype = list(module.parameters())[0].dtype
-        self.offload_device = None #GPUに分割したパラメータは常駐させておく
-        self.offload_device = "cpu"
-        self.offload_param_pin_memory = True
+        # offload_param=True: 分割パラメータ (ds_tensor) を CPU pinned に常駐 (ZeRO-Offload)
+        # offload_param=False: GPU に常駐 (純粋な ZeRO-3 ベースライン)
+        self.offload_device = "cpu" if offload_param else "cuda"
+        self.offload_param_pin_memory = offload_param
         
         self._convert_to_zero_parameters(module) #ここでパラメータの分割をしている, 引数は本家よりも消している
         

@@ -1,8 +1,8 @@
 ###############################################################################
-# _prefetch_run.sh — baseline (prefetch) の nsys / cputrace ラン共通処理
+# _prefetch_run.sh — baseline (prefetch) の nsys ラン共通処理
 #
 # なぜ共通化したか:
-#   run_*_nsys.sh / run_*_cputrace.sh の 6 本が torchrun 起動部をコピペで持っており、
+#   run_*_nsys.sh の各スクリプトが torchrun 起動部をコピペで持っており、
 #   nsys 設定の修正が一部にしか入らない事故が実際に起きた
 #   （--capture-range-end=stop-shutdown、--gpu-metrics-devices=0 固定など）。
 #   起動部はここ 1 箇所に集約し、各スクリプトはモデル固有値だけを持つ。
@@ -21,7 +21,7 @@
 #   SEQ_LEN     --seq-len (空なら渡さない: ViT など)
 #   RB / PB / MLP
 #               --reduce-bucket-size / --prefetch-bucket-size / --max-live-parameters
-#   MODE        nsys (既定) | cputrace
+#   EXTRA_ARGS  run_zero.py に追加で渡す引数 (例: "--no-offload" で純粋 ZeRO-3)
 #
 # 使い方 (2 ノードで別々に起動する):
 #   bluefield01: ./run_opt_1.3b_prefetch_nsys.sh 0
@@ -43,18 +43,9 @@ run_prefetch() {
   mkdir -p "$OUT_DIR"
   export NSYS_OUT_DIR="$OUT_DIR"
 
-  if [[ "${MODE:-nsys}" == "cputrace" ]]; then
-    export NSYS_TRACE="cuda,nvtx,osrt"
-    export NSYS_SAMPLE="process-tree"
-    export NSYS_CPUCTXSW="process-tree"
-    export NSYS_GPU_METRICS=0   # CPU トレース時は GPU metrics を切る (smartnic 側 cputrace と同じ)
-  fi
-
   local SEQ_ARGS=()
   [[ -n "${SEQ_LEN:-}" ]] && SEQ_ARGS=(--seq-len "$SEQ_LEN")
 
-  # XFER_NVTX / STEP_NVTX は cputrace 側にも付ける。
-  # "Other"(ホスト待ち) の内訳を CPU トレースと突き合わせるには NVTX が要るため。
   ENABLE_FULL_PARAM_TRANSFER=0 \
   USE_NVTX_RANGES=0 \
   XFER_NVTX=1 \
@@ -86,6 +77,7 @@ run_prefetch() {
       --reduce-bucket-size "$RB" \
       --prefetch-bucket-size "$PB" \
       --max-live-parameters "$MLP" \
+      ${EXTRA_ARGS:-} \
     2>&1 | tee "$OUT_DIR/${LABEL}_node${NODE_RANK}.log"
 
   echo

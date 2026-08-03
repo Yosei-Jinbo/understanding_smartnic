@@ -7,8 +7,6 @@ project('DOCA_MPI_HOST',
 
 # 実験APIの警告を抑制（必要なら外してOK）
 add_project_arguments('-D', 'DOCA_ALLOW_EXPERIMENTAL_API', language: ['c', 'cpp'])
-# 計測を有効にするにはこの行をコメントアウト
-add_project_arguments('-D', 'AG_TIMING_DISABLED', language: ['c', 'cpp'])
 
 SAMPLE_NAME = 'comch_server'
 
@@ -40,10 +38,14 @@ sample_dependencies = [
 # - DPU 側の .c は含めない（DPU は別 shared_library）
 sample_srcs = [
   SAMPLE_NAME + '.c',
+  'rdma_task.c',
+  'rs_pool.c',
+  'mmap_cache.c',
+  'union_tracker.c',
+  'collective.c',
+  'handlers.c',
   '../common/comch_ctrl_path_common.c',
   '../common/common.c',
-  '../common/dma_common.c',
-  '../common/rdma_common.c',
   '../common/doca_rdma_utils.c',
   '../common/mpi_exchange.c',
 ]

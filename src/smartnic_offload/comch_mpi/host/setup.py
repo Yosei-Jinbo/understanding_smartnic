@@ -119,11 +119,9 @@ ext = CppExtension(
     sources=[
         "doca_comch_client_pybind.cpp",
         "../common/common.c",
-        "../common/rdma_common.c",
         "../common/comch_ctrl_path_common.c",
-        "../common/dma_common.c",
-        "doca_comch_client_interface.c",
         "comch_client.c",
+        "collective_queue.c",
         "../common/doca_rdma_utils.c",
         "../common/mpi_exchange.c",
     ],

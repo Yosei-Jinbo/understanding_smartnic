@@ -151,6 +151,7 @@ def _torch_reduce_scatter_fn(input_tensor: torch.Tensor,
 def reduce_scatter_coalesced(
     tensors: List[Tensor],
     group: ProcessGroup = None,
+    completion_poller: bool = True,
 ) -> List[Tensor]:
     this_rank = dist.get_rank(group)
     world_sz = dist.get_world_size(group)
@@ -193,9 +194,15 @@ def reduce_scatter_coalesced(
     dbg.log_reduce_scatter(tensor_partition_flat_buffer, None, sub_group_id="flat_input")
 
     t_rs_start = time.perf_counter()
-    # DMA ポーラー準備 (RS 出力テンソルのデバイスで)
-    _rs_device = tensor_partition_buffer_for_each_rank[this_rank].device
-    _rs_poller = _DmaCompletionPoller(_rs_device)
+    # RS 完了ポーラー: 従来挙動 (ZO) では RS 完了時刻の計測のためにホストが
+    # RS カーネル完了までスピン待ちする。completion_poller=False (--no-offload)
+    # ではこのブロックを省略し、async_op=False の dist.reduce_scatter が内部で張る
+    # ストリーム依存 (cudaStreamWaitEvent) に順序保証を委ねる (ホストは先行可能)。
+    _rs_poller = None
+    if completion_poller:
+        # DMA ポーラー準備 (RS 出力テンソルのデバイスで)
+        _rs_device = tensor_partition_buffer_for_each_rank[this_rank].device
+        _rs_poller = _DmaCompletionPoller(_rs_device)
 
     # Phase 20: bracket the NCCL RS enqueue + wait-event for symmetric stall measurement
     try:
@@ -220,15 +227,16 @@ def reduce_scatter_coalesced(
             _tracker.end(_h)
     else:
         _torch_reduce_scatter_fn(tensor_partition_flat_buffer, tensor_partition_buffer_for_each_rank[this_rank], group=group)
-    # RS 完了後にフラグ書き込みを投入してポーリング
-    _rs_poller.record()
-    torch.cuda.nvtx.range_push("rs_wait")
-    try:
-        _rs_poller.join()
-    finally:
-        torch.cuda.nvtx.range_pop()
-    t_rs_end = _rs_poller.t_complete or time.perf_counter()
-    _accumulate_reduce_scatter_time_ms((t_rs_end - t_rs_start) * 1000.0)
+    if _rs_poller is not None:
+        # RS 完了後にフラグ書き込みを投入してポーリング
+        _rs_poller.record()
+        torch.cuda.nvtx.range_push("rs_wait")
+        try:
+            _rs_poller.join()
+        finally:
+            torch.cuda.nvtx.range_pop()
+        t_rs_end = _rs_poller.t_complete or time.perf_counter()
+        _accumulate_reduce_scatter_time_ms((t_rs_end - t_rs_start) * 1000.0)
 
     output_lst: List[Tensor] = [None] * len(tensors)
     offset = 0
@@ -298,7 +306,8 @@ class ZeroOptimizer3(object):
                  overlap_comm=True,
                  sub_group_size=1000000000000,
                  gradient_accumulation_steps=1,
-                 communication_data_type=torch.float32):
+                 communication_data_type=torch.float32,
+                 offload=True):
         
         see_memory_usage("Stage 3 initialize beginning", force=True)
         print_rank_0(f"initialized {__class__.__name__} with args: {locals()}",
@@ -312,19 +321,24 @@ class ZeroOptimizer3(object):
         self.unflatten = unflatten
         self.dtype = self.optimizer.param_groups[0]['params'][0].dtype
         
-        '''ZeRO Offloadのための追加分'''
-        self.offload_optimizer = True
-        self.offload_optimizer_pin_memory = True
-        self.offload_param = True
-        self.offload_param_pin_memory = True 
-        
+        '''ZeRO Offloadのための追加分
+        offload=True : optimizer 状態 + fp32 マスタ + 分割 fp16 を CPU に置き、
+                       Adam は worker (thread/process) で実行 (ZeRO-Offload、DPU 可)
+        offload=False: 全て GPU 常駐、Adam も in-process の torch.optim.Adam で実行
+                       (純粋な ZeRO-3 ベースライン。DPU は利用不可)'''
+        self.offload_optimizer = offload
+        self.offload_optimizer_pin_memory = offload
+        self.offload_param = offload
+        self.offload_param_pin_memory = offload
+
         self.parameter_offload = ZeroOffload(
             module=module,
             timers=timers,
             overlap_comm=overlap_comm,
             prefetch_bucket_size=prefetch_bucket_size,
             max_reuse_distance=max_reuse_distance,
-            max_live_parameters=max_live_parameters)
+            max_live_parameters=max_live_parameters,
+            offload_param=self.offload_param)
 
         self.module = module
         
@@ -364,6 +378,7 @@ class ZeroOptimizer3(object):
         self._adam_process = None
         self._adam_thread = None   # DISABLE_ADAM_FORK=1 時の threading 経路用
         self._adam_step_pending = False
+        self._gpu_optimizer = None # 非offload時のみ _setup_for_real_optimizer で構築
         
         #この変数いらないかも
         self.next_swappable_fp32_partitioned_groups = [] #FP32 パーティションの スワップ（入れ替え/オフロード）候補キュー。I/O と計算を重ねるための先読み・交換管理
@@ -543,10 +558,13 @@ class ZeroOptimizer3(object):
             aggregate_param_count += params_in_group
             if flat_buffer_size > 0:
                 print_rank_0(f"group {j} flat buffer size {flat_buffer_size}", force=False)
+                # offload時: CPU pinned / 非offload時: GPU (self.device が切り替える。
+                # 変数名は歴史的経緯で cpu_memory のままだが GPU 常駐のこともある)
                 self.param_groups_fp16_flat_cpu_memory.append(
                     torch.empty(int(flat_buffer_size),
                                 dtype=self.dtype,
-                                pin_memory=True, device=self.device))
+                                pin_memory=self.offload_param_pin_memory,
+                                device=self.device))
         
     def _create_fp16_partitions_with_defragmentation(self):
         dist.barrier() #CPU同期
@@ -573,8 +591,11 @@ class ZeroOptimizer3(object):
                 fp16_partitioned_group_flat = self.param_groups_fp16_flat_cpu_memory[param_group_idx].narrow(0, flat_offset, total_elements) #すべてのsub_groupをCPU上にぶち込める
                 self.fp16_partitioned_groups_flat.append(fp16_partitioned_group_flat) #CPU記憶領域のリスト, NVMeは積まれない
                 flat_offset += total_elements
+                # フラットバッファは直上で torch.empty した未初期化領域なので、
+                # offload の有無に関わらず必ず ds_tensor の中身をコピーして詰める
+                # (avoid_copy=True にすると未初期化データを指してしまう)
                 self._move_to_flat_buffer(sub_group,
-                                              fp16_partitioned_group_flat, avoid_copy=not self.offload_param)
+                                              fp16_partitioned_group_flat, avoid_copy=False)
         
         
     def _release_ipg_buffers(self):
@@ -583,10 +604,12 @@ class ZeroOptimizer3(object):
             
     
     def _create_fp32_partitions(self):
-        '''FP32マスターのフラットバッファを1本だけ作成。shared memory で child process と共有。'''
+        '''FP32マスターのフラットバッファを1本だけ作成。
+        offload時は shared memory で child process と共有、非offload時は GPU 常駐。'''
         for i, tensor in enumerate(self.fp16_partitioned_groups_flat):
             src = self.fp16_partitioned_groups_flat[i].to(self.device).clone().float().detach()
-            src.share_memory_()
+            if self.offload_optimizer:
+                src.share_memory_()
             self.fp32_partitioned_groups_flat.append(src)
             self.fp32_partitioned_groups_flat[i].requires_grad = True
         for param_group in self.optimizer.param_groups:
@@ -615,19 +638,29 @@ class ZeroOptimizer3(object):
             num_elements = int(self.fp16_partitioned_groups_flat_numel[i])
             see_memory_usage(f'[Begin] Initialize optimizer states {i} / {num_subgroups} subgroups, num_elems: {num_elements}', force=False)
 
-            # 勾配の双バッファ: shared memory + cudaHostRegister で pinned 化
-            buf0 = torch.zeros(num_elements, dtype=gradient_dtype, device=self.device)
-            buf0.share_memory_()
-            self._pin_shared_memory(buf0)
-            self.fp32_grad_bufs[0].append(buf0)
+            if self.offload_optimizer:
+                # 勾配の双バッファ: shared memory + cudaHostRegister で pinned 化。
+                # DPU (遅延更新) が buf0/buf1 を交互に使う。
+                buf0 = torch.zeros(num_elements, dtype=gradient_dtype, device=self.device)
+                buf0.share_memory_()
+                self._pin_shared_memory(buf0)
+                self.fp32_grad_bufs[0].append(buf0)
 
-            buf1 = torch.zeros(num_elements, dtype=gradient_dtype, device=self.device)
-            buf1.share_memory_()
-            self._pin_shared_memory(buf1)
-            self.fp32_grad_bufs[1].append(buf1)
+                buf1 = torch.zeros(num_elements, dtype=gradient_dtype, device=self.device)
+                buf1.share_memory_()
+                self._pin_shared_memory(buf1)
+                self.fp32_grad_bufs[1].append(buf1)
 
-            self.fp32_partitioned_groups_flat[i].grad = buf0
-            self._optimizer_step(i)
+                # ゼロ勾配 warmup step: in-process optimizer の Adam 状態を実体化
+                # (勾配は全ゼロなので重みは変化しない)
+                self.fp32_partitioned_groups_flat[i].grad = buf0
+                self._optimizer_step(i)
+            else:
+                # 非offload (GPU 常駐): DPU を使わないので単バッファで十分。
+                # grad_buf_switch は 0 のまま動かないので bufs[0] だけ埋める。
+                # Adam 状態は torch.optim.Adam が初回 step で lazy に作る。
+                buf0 = torch.zeros(num_elements, dtype=gradient_dtype, device=self.device)
+                self.fp32_grad_bufs[0].append(buf0)
 
             see_memory_usage(f'[End] Initialize optimizer states {i} / {num_subgroups} subgroups, num_elems: {num_elements}', force=False)
 
@@ -648,7 +681,19 @@ class ZeroOptimizer3(object):
         self.initialize_optimizer_states() #実際のoptimizer stateを初期化(自分の担当分のみの初期化) 登録されているのが自分の分のため
         see_memory_usage("After initializing optimizer states", force=False)
         dist.barrier()
-        
+
+        if not self.offload_optimizer:
+            # 非offload: in-process の GPU Adam を fp32 マスタフラットに対して構築。
+            # 元 optimizer (carrier) の param_group ごとのハイパラを引き継ぐ。
+            groups = []
+            for gid, pg in enumerate(self.optimizer.param_groups):
+                params = [self.fp32_partitioned_groups_flat[i]
+                          for i in range(len(self.fp16_groups))
+                          if self.sub_group_to_group_id[i] == gid]
+                opts = {k: v for k, v in pg.items() if k != 'params'}
+                groups.append({'params': params, **opts})
+            self._gpu_optimizer = torch.optim.Adam(groups)
+
         if dist.get_rank() == 0:
             logger.info(f"optimizer state initialized")
         
@@ -658,7 +703,7 @@ class ZeroOptimizer3(object):
         grad_partitions_flat_buffer = None
         self.__param_id_to_grad_partition: Dict[int, Tensor] = {} #param_id => partition_flat_bufferのどの領域か?
         all_params = list(itertools.chain.from_iterable(self.fp16_groups)) #1列のリストにする
-        grad_partitions_flat_buffer: Tensor = torch.zeros(sum(p.partition_numel() for p in all_params), dtype=self.dtype, device=self.device, pin_memory=True)
+        grad_partitions_flat_buffer: Tensor = torch.zeros(sum(p.partition_numel() for p in all_params), dtype=self.dtype, device=self.device, pin_memory=self.offload_optimizer_pin_memory)
                 
         offset = 0
         #param.ds_id: 各パラメータに割り振られた一意なid
@@ -797,7 +842,7 @@ class ZeroOptimizer3(object):
 
             # 集約済み勾配 (fp16) を GPU→CPU に転送。このイベント区間で D2H 時間を計測する。
             self.__partition_grads(self.__params_in_ipg_bucket, grad_partitions)
-            
+
             end_event.record()
             end_event.synchronize()
             _accumulate_grad_offload_d2h_time_ms(start_event.elapsed_time(end_event))
@@ -835,7 +880,9 @@ class ZeroOptimizer3(object):
             full_grads_for_rank = [g.float() for g in full_grads_for_rank]
             
         #複数テンソルをまとめてreduce_scatter, 返り値はreduce済み自分の担当勾配
-        grad_partitions_for_rank = reduce_scatter_coalesced(full_grads_for_rank, self.dp_process_group)
+        # 非offload (--no-offload) では RS 完了スピン待ちを外す (ZO は従来挙動を維持)
+        grad_partitions_for_rank = reduce_scatter_coalesced(full_grads_for_rank, self.dp_process_group,
+                                                            completion_poller=self.offload_optimizer)
         
         if self.communication_data_type == torch.float32:
             grad_partitions_for_rank = [g.to(dtype) for g in grad_partitions_for_rank]
@@ -899,7 +946,14 @@ class ZeroOptimizer3(object):
                         fp32_grad_tensor.copy_(grad_buffer)  # fp16 grad -> fp32 grad buf
                     finally:
                         _xfer_pop()
-                
+            else:
+                # 非offload: fp32 勾配バッファは GPU 常駐なので fp16->fp32 の
+                # キャストコピーのみ (D2H ではないため xfer NVTX は付けない)
+                i, dest_offset, _ = self.grad_position[self.get_param_id(param)]
+                if self.is_gradient_accumulation_boundary:
+                    fp32_grad_tensor = self.fp32_grad_bufs[self.grad_buf_switch][i].narrow(0, dest_offset, grad_buffer.numel())
+                    fp32_grad_tensor.copy_(grad_buffer)
+
             param.grad.record_stream(torch.cuda.current_stream())
             param.grad = None
             
@@ -1022,6 +1076,15 @@ class ZeroOptimizer3(object):
 
         from common import debug_params as dbg
 
+        if not self.offload_optimizer:
+            # 非offload: in-process の GPU Adam で全サブグループを一括更新。
+            # 勾配は __partition_grads が fp32_grad_bufs[0] (GPU) に書き込み済み。
+            for i, w in enumerate(self.fp32_partitioned_groups_flat):
+                w.grad = self.fp32_grad_bufs[0][i]
+            self._gpu_optimizer.step()
+            for w in self.fp32_partitioned_groups_flat:
+                w.grad = None
+
         #update parameters one sub group at a time
         for sub_group_id, group in enumerate(self.fp16_groups):
 
@@ -1030,8 +1093,9 @@ class ZeroOptimizer3(object):
 
             dbg.log_param_update("BEFORE_STEP", sub_group_id, self.fp32_partitioned_groups_flat[sub_group_id])
 
-            #apply the optimizer step on the sub group and copy fp32 parameters to fp16
-            self._optimizer_step(sub_group_id) #sub_groupに対応するfp32マスタコピーを登録してそのままoptimizer.step()を行う
+            if self.offload_optimizer:
+                #apply the optimizer step on the sub group and copy fp32 parameters to fp16
+                self._optimizer_step(sub_group_id) #sub_groupに対応するfp32マスタコピーを登録してそのままoptimizer.step()を行う
 
             dbg.log_param_update("AFTER_STEP", sub_group_id, self.fp32_partitioned_groups_flat[sub_group_id])
 
@@ -1062,6 +1126,8 @@ class ZeroOptimizer3(object):
     @instrument_w_nvtx
     def step_dpu(self, first_step=False):
         """child process に Adam step コマンドを送信 (non-blocking)。"""
+        assert self.offload_optimizer, \
+            "DPU (delayed parameter update) は CPU オフロード時のみ利用可能 (--no-offload では使えない)"
         from common import debug_params as dbg
         self._adam_step_pending = False
         if not first_step:
@@ -1091,8 +1157,11 @@ class ZeroOptimizer3(object):
           DeepSpeedCPUAdam の step() は C++ 拡張で GIL を release するため、
           main thread(GPU kernel launch)との overlap は実質失われない。
         それ以外(default): multiprocessing.Process(fork) で別プロセス起動(従来通り)。
+        非offload時は in-process GPU Adam を使うので worker は起動しない (no-op)。
         """
         import os
+        if not self.offload_optimizer:
+            return
         defaults = {k: v for k, v in self.optimizer.defaults.items()}
 
         if os.environ.get("DISABLE_ADAM_FORK", "0") == "1":

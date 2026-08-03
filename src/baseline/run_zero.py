@@ -401,7 +401,8 @@ def run_zero(use_profiler=False, use_bf16=False, use_ema=False,
              model_name="vit_l_16", dataset_name="cifar10", batch_size=64,
              warmup_iters=None, measure_iters=None, seq_len=1024, num_epochs=None,
              reduce_bucket_size=int(1e8), prefetch_bucket_size=int(1e8),
-             max_reuse_distance=0, max_live_parameters=int(1.5e8)):
+             max_reuse_distance=0, max_live_parameters=int(1.5e8),
+             no_offload=False):
     profiler = None
     zero_model = None
     try:
@@ -447,13 +448,16 @@ def run_zero(use_profiler=False, use_bf16=False, use_ema=False,
             WARMUP_STEPS = int(os.environ.get("TIMING_WARMUP_STEPS", "5"))
             epochs = num_epochs if num_epochs is not None else 5
 
-        DPU_THRESHOLD = -1
+        # ZeRO-Offload (既定): 全エポック DPU 経路 (CPU Adam worker + 遅延更新)。
+        # --no-offload (純粋 ZeRO-3): worker がないため通常経路 (zero_model.step()) を使う。
+        DPU_THRESHOLD = 10**9 if no_offload else -1
         global_iter = 0
 
         print_rank_0(
             f"[CONFIG] model={model_name} dataset={dataset_name} batch_size={batch_size} "
             f"epochs={epochs} warmup_iters={warmup_iters} measure_iters={measure_iters} "
-            f"is_causal_lm={is_causal_lm}"
+            f"is_causal_lm={is_causal_lm} "
+            f"mode={'zero3-gpu (no-offload)' if no_offload else 'zero-offload (cpu)'}"
         )
 
         # ----------------------------------------------------------
@@ -579,9 +583,10 @@ def run_zero(use_profiler=False, use_bf16=False, use_ema=False,
             prefetch_bucket_size=prefetch_bucket_size,
             max_reuse_distance=max_reuse_distance,
             max_live_parameters=max_live_parameters,
+            offload=not no_offload,
         )
 
-        # CPU Adam を別プロセスで起動
+        # CPU Adam を別プロセスで起動 (--no-offload 時は optimizer 側で no-op)
         zero_model.start_adam_process(cpu_affinity=cpu_thread_set)
 
         timers = SynchronizedWallClockTimer()
@@ -1146,6 +1151,8 @@ def main():
     parser.add_argument("--prefetch-bucket-size", type=float, default=1e8)
     parser.add_argument("--max-reuse-distance", type=float, default=0)
     parser.add_argument("--max-live-parameters", type=float, default=1.5e8)
+    parser.add_argument("--no-offload", action="store_true",
+                        help="CPU オフロードを無効化して純粋な ZeRO-3 (全 GPU 常駐 + in-process GPU Adam) で動かす")
     args = parser.parse_args()
 
     if args.debug_params:
@@ -1167,6 +1174,7 @@ def main():
         prefetch_bucket_size=int(args.prefetch_bucket_size),
         max_reuse_distance=int(args.max_reuse_distance),
         max_live_parameters=int(args.max_live_parameters),
+        no_offload=args.no_offload,
     )
 
 

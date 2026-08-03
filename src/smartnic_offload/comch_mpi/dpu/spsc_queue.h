@@ -7,7 +7,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 
-#include "comch_server.h" //doca_rdma_task_type_t, doca_task_descのインクルード
+#include "comch_server.h" //fp16_tのインクルード
 
 //キャッシュ来の境界
 #define CACHE_LINE_SIZE 64
@@ -24,15 +24,11 @@ typedef struct {
     int stride_id; //リクエスト側にどのストライド分が終了したのかを伝える
 } completion_event_t;
 
-/* =====================================================
- * SPSC（Single Producer Single Consumer）キュー マクロテンプレート
- *
- * 使い方:
- *   DEFINE_SPSC_QUEUE(spsc_doca_task_queue, struct doca_task_desc, 64)
- * で以下が生成される:
- *   - 型:   spsc_doca_task_queue_t
- *   - 関数: spsc_doca_task_queue_init / _push / _pop / _is_empty
- * ===================================================== */
+/*
+ * SPSC (Single Producer Single Consumer) キュー マクロテンプレート。
+ * DEFINE_SPSC_QUEUE(NAME, ELEM, CAP) で 型 NAME##_t と _init/_push/_pop/_is_empty
+ * を生成する。
+ */
 
 #define DEFINE_SPSC_QUEUE(NAME, ELEM_TYPE, CAPACITY)                          \
                                                                               \
@@ -85,21 +81,7 @@ static inline bool NAME##_is_empty(NAME##_t *q)                               \
     return head == tail;                                                      \
 }
 
-/* =====================================================
- * キューのインスタンス化
- * ===================================================== */
-
-/* DOCA RDMA タスクキュー (64 スロット) */
-DEFINE_SPSC_QUEUE(spsc_doca_task_queue,    struct doca_task_desc, 64)
-
-/* 完了通知キュー (64 スロット) */
-DEFINE_SPSC_QUEUE(spsc_completion_queue,   completion_event_t,   64)
-
-/* =====================================================
- * RS (Reduce-Scatter) タスク用SPSCキュー
- * 集約演算のsubmit/wait分離を実現
- * ===================================================== */
-
+/* RS (Reduce-Scatter) タスク用SPSCキュー: 集約演算の submit/wait 分離 */
 struct rs_task {
     fp16_t   *dst;
     fp16_t   *src;

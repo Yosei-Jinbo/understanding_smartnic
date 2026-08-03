@@ -32,27 +32,7 @@ using std::memory_order_relaxed;
 #include <doca_log.h>
 
 /* ---- 定数 ---- */
-#define DOCA_RDMA_MAX_SEND_QUEUE_SIZE  128
-#define DOCA_RDMA_MAX_RECV_QUEUE_SIZE  128
 #define DOCA_RDMA_BUF_INVENTORY_SIZE   256
-#define DOCA_RDMA_MAX_TASKS            64
-
-/* ---- コールバックで使う完了通知構造体 (C++ atomic 互換のため extern "C" の外) ---- */
-typedef struct {
-    atomic_int  pending;     /* 残タスク数 */
-    atomic_bool error;       /* エラー発生フラグ */
-} doca_rdma_completion_t;
-
-static inline void doca_rdma_completion_init(doca_rdma_completion_t *comp, int count)
-{
-    atomic_store(&comp->pending, count);
-    atomic_store(&comp->error, false);
-}
-
-static inline bool doca_rdma_completion_done(const doca_rdma_completion_t *comp)
-{
-    return atomic_load(&comp->pending) <= 0;
-}
 
 #ifdef __cplusplus
 extern "C" {
@@ -218,15 +198,5 @@ static inline doca_error_t doca_rdma_get_remote_buf(
 #ifdef __cplusplus
 }
 #endif
-
-/* PE を回して completion が完了するまで待つ (atomic 使用のため extern "C" の外) */
-static inline void doca_rdma_wait_completion(
-    struct doca_rdma_ctx_t *ctx,
-    doca_rdma_completion_t *comp)
-{
-    while (!doca_rdma_completion_done(comp)) {
-        doca_pe_progress(ctx->pe);
-    }
-}
 
 #endif /* DOCA_RDMA_UTILS_H */
