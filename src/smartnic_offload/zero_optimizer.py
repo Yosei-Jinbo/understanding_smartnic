@@ -1,6 +1,5 @@
 import sys
 import os
-import argparse
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from common.utils import logger
 import torch
@@ -22,7 +21,6 @@ from torch import Tensor
 from torch.nn import Parameter
 from deepspeed.ops.adam import DeepSpeedCPUAdam
 from concurrent.futures import ThreadPoolExecutor
-from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 import threading
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -39,14 +37,8 @@ from doca_comch_client_pybind import CollectiveCommunication
 def print_rank_0(message, debug=False, force=False):
     rank = dist.get_rank()
     if rank == 0 and (debug or force):
-        #print(message)
         pass
     
-def _flatten(tensors):
-    # dtype / device を揃えておくこと（ここでは fp32/CPU を想定）
-    ts = [t.detach().contiguous() for t in tensors]
-    return _flatten_dense_tensors(ts)
-
 class _ComchHandleWork:
     """
     C 側の handle を保持して wait/test/release する Work。
@@ -537,7 +529,6 @@ class ZeroOptimizer3(object):
         return sub_groups
     
     #(可能なら)各パラメータを1本のフラットCPUバッファへ順番に詰めなおし、元のparam.ds_tensorがそのフラット領域をさすように付け替える関数
-    #self._move_to_flat_buffer(sub_group, fp16_partitioned_group_flat, avoid_copy=not self.offload_param)
     def _move_to_flat_buffer(self, param_list, flat_buffer, avoid_copy=False):
         if flat_buffer is None:
             return
@@ -713,7 +704,6 @@ class ZeroOptimizer3(object):
                     int(current_offset),
                     int(num_elements)
                 ]
-                #print(f"param id {param_id} i:{i}, ds_tensor {num_elements} numel {param.numel()}")
                 current_offset += num_elements
         see_memory_usage(f"After Set Grad positions", force=False)
     
@@ -1059,19 +1049,12 @@ class ZeroOptimizer3(object):
     def _release_sub_group(self, sub_group_id, timer_names=set()):
         
         see_memory_usage(f'Before release optimizer sub group {sub_group_id}', force=False)
-        # get rid of the fp32 gradients. Not needed anymore
-        #CPUにfp32 gradientが常駐しているのでNoneにして消さなくてもいい
-        #self.fp32_partitioned_groups_flat[sub_group_id].grad = None
+        # fp32 grad は CPU 常駐のため、ここで解放しなくてよい
 
         see_memory_usage(f'After release optimizer sub group {sub_group_id}', force=False)
         
     @instrument_w_nvtx
     def _post_step(self, timer_names=set()):
-        if self.offload_optimizer: #Offloadしないから今は無視
-            #self.reset_cpu_buffers() #overflowなどのリセットだったので無視する
-            pass
-            
-        #self.log_timers(timer_names)
         see_memory_usage('After zero_optimizer step', force=False)
         print_rank_0(f"------------------Finishing Step-----------------------")
         

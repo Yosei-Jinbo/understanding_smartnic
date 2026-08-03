@@ -105,7 +105,7 @@ doca_error_t run_mpi_tag_exchange_cmd(uint64_t rank, uint64_t world_size,
 }
 
 /*
- * Phase 15: 異なる MPI タグで交換する variant。
+ * 異なる MPI タグで交換する variant。
  * Ring 1 の接続確立など、既存の Ring 0 用交換 (tag 0x500) と区別するために使う。
  */
 doca_error_t run_mpi_tag_exchange_cmd_tagged(uint64_t rank, uint64_t world_size,

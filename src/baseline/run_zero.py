@@ -124,12 +124,6 @@ def warmup_cpuadam_once(comm, rank):
     comm.Barrier()
 
 
-def set_seed(seed: int, rank: int):
-    seed = seed + rank
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-
 def dump_final_params(model, rank: int, path_prefix: str):
     """訓練後の各パラメータのローカルシャード (ds_tensor) を ds_id 順に連結し、
     ビット再現性検証用に <path_prefix>.rank<rank>.pt へ保存 + sha256 を表示する。
@@ -399,11 +393,6 @@ class StepTimeStats:
         print("=" * 80)
 
 
-def _print_all_comm_stats():
-    """通信/転送の時間・回数・バイトはコード内計測を廃止し nsys に一本化した。"""
-    pass
-
-
 def _train_step_normal(zero_model, loss_fn, inputs, timers, stats,
                        is_causal_lm, is_mlm):
     """通常経路: fwd → bwd → 同期 Adam step (同一 step 内で反映)。"""
@@ -583,7 +572,7 @@ def run_zero(use_profiler=False, use_bf16=False, use_ema=False,
 
         # このエポック以下は正常経路 (同期 step)、超えたら DPU (delayed parameter update) 経路。
         # 既定 10**9 = 全エポック通常経路。環境変数で上書き可能 (例: DPU_THRESHOLD=-1 で全エポック DPU)。
-        dpu_threshold = int(os.environ.get("DPU_THRESHOLD", "-1"))
+        dpu_threshold = int(os.environ.get("DPU_THRESHOLD", "1000000000"))
         if no_offload:
             # 純粋 ZeRO-3 (GPU) モード: CPU Adam worker がないため DPU は使えない。
             if "DPU_THRESHOLD" in os.environ:
@@ -699,10 +688,7 @@ def run_zero(use_profiler=False, use_bf16=False, use_ema=False,
                     from common import debug_params as dbg
                     dbg.set_step(step + epoch * total_steps)
 
-                    # 注: ここで optimizer.zero_grad は呼ばない。run_zero.py の optimizer
-                    # (DeepSpeedCPUAdam) は param_groups が空にされる設定キャリアで no-op。
-                    # 実際の勾配クリアは wrapper 内 _take_model_step(_dpu) が呼ぶ
-                    # ZeroOptimizer3.zero_grad (fp16 param の .grad=None 化) が行う。
+                    # optimizer.zero_grad はここでは呼ばない (勾配クリアは wrapper 側の ZeroOptimizer3.zero_grad が担当)。
                     if use_dpu:
                         _train_step_dpu(zero_model, loss_fn, inputs, timers, stats,
                                         is_causal_lm, is_mlm)
@@ -730,7 +716,6 @@ def run_zero(use_profiler=False, use_bf16=False, use_ema=False,
                                 torch.cuda.synchronize()
                             except Exception:
                                 pass
-                            _print_all_comm_stats()
                             sys.stdout.flush()
                         dist.barrier()  # キャプチャ窓の終端も揃える (start 側と対)
                         torch.cuda.profiler.stop()
@@ -787,7 +772,6 @@ def run_zero(use_profiler=False, use_bf16=False, use_ema=False,
 
         if rank == 0:
             stats.print_all()
-            _print_all_comm_stats()
 
             try:
                 print(memory_usage_rank(model, optimizer=optimizer))

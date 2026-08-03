@@ -1,6 +1,5 @@
 import sys
 import os
-import argparse
 import time
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from common.utils import logger
@@ -23,7 +22,6 @@ from torch import Tensor
 from torch.nn import Parameter
 from deepspeed.ops.adam import DeepSpeedCPUAdam
 from concurrent.futures import ThreadPoolExecutor
-from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
 # H2D/D2H の転送時間は CUDA Event ベースの計測 (_accumulate_grad_offload_d2h_* 系) で取得する。
 
@@ -48,16 +46,6 @@ def print_rank_0(message, debug=False, force=False):
     if rank == 0 and (debug or force):
         pass
     
-def _flatten(tensors):
-    # dtype / device を揃えておくこと（ここでは fp32/CPU を想定）
-    ts = [t.detach().contiguous() for t in tensors]
-    return _flatten_dense_tensors(ts)
-
-def _unflatten(flat, like_tensors):
-    # like_tensors の shape に合わせて view を作る
-    return _unflatten_dense_tensors(flat, [t.detach().contiguous() for t in like_tensors])
-
-
 @instrument_w_nvtx
 def _torch_reduce_scatter_fn(input_tensor: torch.Tensor,
                              output_tensor: torch.Tensor,

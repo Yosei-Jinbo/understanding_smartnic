@@ -38,10 +38,6 @@ def debug_module2name_id(module):
     return f"name={debug_module2name(module)} id={module.id}"
 
 
-def debug_module2name_class(module):
-    return f"name={debug_module2name(module)} {module.__class__.__name__}"
-
-
 def debug_param2name(param):
     if param in param_names:
         return param_names[param]
@@ -59,10 +55,6 @@ def debug_param2name_id_shape(param):
 
 def debug_param2name_id_shape_device(param):
     return f"name={debug_param2name(param)} id={param.ds_id} shape={param.data.shape} device={param.device}"
-
-
-def debug_param2name_id_numel(param):
-    return f"name={debug_param2name(param)} id={param.ds_id} numel={param.numel()}"
 
 
 def debug_param2name_id_shape_status(param):
@@ -96,24 +88,6 @@ def log_rank_file(rank, *msgs):
     for m in msgs:
         fh.write(f"{m}\n")
     fh.flush()
-
-
-def print_backward_tensors(tensor):
-    def _print_bwd_tensors(grad_fn):
-        print(f"Backward tensors in {grad_fn}")
-        for funcs in grad_fn.next_functions:
-            if funcs[0]:
-                try:
-                    tensor = getattr(funcs[0], 'variable')
-                    print(funcs[0])
-                    print(
-                        f"Tensor - id: {id(tensor)}, shape: {tensor.shape}, data: {tensor}, grad: {tensor.grad}"
-                    )
-                except AttributeError as e:
-                    _print_bwd_tensors(funcs[0])
-
-    if hasattr(tensor, 'grad_fn'):
-        _print_bwd_tensors(tensor.grad_fn)
 
 
 def see_memory_usage(message, force=False):

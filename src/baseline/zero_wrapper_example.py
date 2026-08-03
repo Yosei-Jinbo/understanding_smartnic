@@ -1,6 +1,5 @@
 import sys
 import os
-import argparse
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from common.utils import SynchronizedWallClockTimer
 
@@ -79,24 +78,6 @@ def instrument_w_nvtx(func):
         return wrapped_fn
     else:
         return func
-
-def split_half_float_double_sparse(tensors):
-    supported_types = [
-        "torch.cuda.HalfTensor",
-        "torch.cuda.FloatTensor",
-        "torch.cuda.DoubleTensor",
-        "torch.cuda.BFloat16Tensor",
-    ]
-
-    for t in tensors:
-        assert t.type() in supported_types, f"attempting to reduce an unsupported grad type: {t.type()}"
-
-    buckets = []
-    for i, dtype in enumerate(supported_types):
-        bucket = [t for t in tensors if t.type() == dtype]
-        if bucket:
-            buckets.append((dtype, bucket))
-    return buckets
 
 
 module_names = {}
@@ -232,7 +213,7 @@ class ZeroWrapperExample(Module):
     
     def _configure_distributed_model(self, model):
         self._set_client_model(model)
-        #model parameterのtype調整はDeepSpeed外で行う, ただし、ZeRO Optimizerのcommunication typeに注意!!!
+        #model parameter の type 調整は DeepSpeed 外で行う (ZeRO Optimizer の communication type と整合させること)
         self.module.to(self.device) #ここもOffloadを実装するときには変えてね
         #ampの確認が必要だが、bf16では基本的に利用しないので本家とは違いチェックはしない
         self._broadcast_model()

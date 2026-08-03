@@ -506,7 +506,7 @@ static void ring_queue_push(struct collective_worker_t *cw, int ring_id, struct 
  *   - Tier 2 で burst 間の短 gap を吸収
  *   - Tier 3 は step 境界や idle 区間のみ (wake-up latency 許容)
  *
- * 注意: spin 中も stop flag を check して shutdown race を避ける */
+ * spin 中も stop flag を check して shutdown race を避ける */
 static struct ring_job *ring_queue_pop_blocking(struct collective_worker_t *cw, int ring_id)
 {
     /* ---- Tier 1: fast path (no spin, no cond_wait) ---- */
@@ -777,7 +777,7 @@ static void message_recv_callback(struct doca_comch_event_msg_recv *event,
 
     if (!sample_objects->msg_pool || msg_pool_try_submit(sample_objects->msg_pool, w) != 0) {
         /* msg_pool 満杯または無効: drop して解放
-         * 注意: recv_cmd は buf_copy 内部を指すポインタなので free(recv_cmd) してはいけない */
+         * recv_cmd は buf_copy 内部を指すポインタなので free(recv_cmd) してはいけない */
         if (sample_objects->msg_pool)
             DOCA_LOG_WARN("msg_pool queue full, dropping collective command");
         free(w); free(buf_copy);

@@ -85,21 +85,3 @@ def stream_wait_value_eq(stream, gpu_addr: int, value: int) -> None:
         raise RuntimeError(
             f"cuStreamWaitValue32 failed: code={res} addr=0x{gpu_addr:x} value={value}"
         )
-
-
-def stream_wait_value_geq(stream, gpu_addr: int, value: int) -> None:
-    """GEQ variant — block until *gpu_addr >= value."""
-    _ensure_init()
-    if _cuStreamWaitValue32 is None:
-        raise RuntimeError(f"cuStreamWaitValue32 not available: {_init_error}")
-    cu_stream = ctypes.c_void_p(stream.cuda_stream)
-    res = _cuStreamWaitValue32(
-        cu_stream,
-        gpu_addr,
-        value,
-        CU_STREAM_WAIT_VALUE_GEQ,
-    )
-    if res != 0:
-        raise RuntimeError(
-            f"cuStreamWaitValue32 (GEQ) failed: code={res} addr=0x{gpu_addr:x} value={value}"
-        )

@@ -63,7 +63,7 @@ enum control_cmd_type {
     /*----------DPU-DPUでやり取りされる制御メッセージ----------*/
     CONTROL_CMD_UCP_CONNECT_DPU_DPU, //send->receive, receive->send両方共通で自分のエンドポイント情報を持っておけばOK
 
-    /* Phase 14: GPU flag pool init (ホスト→DPU 一回限り) */
+    /* GPU flag pool init (ホスト→DPU 一回限り) */
     CONTROL_CMD_UCP_INIT_FLAG_POOL,
 };
 
@@ -74,7 +74,7 @@ struct ucp_connect_host_dpu_cmd_msg {
     /* Multi-Rail: 2 番目のポートの接続記述子 (0 ならシングルレール) */
     void *remote_ucp_worker_address_rail1;
     uint64_t remote_ucp_worker_address_len_rail1;
-    /* Phase 5 Step 3: RDMA Doorbell — Host doorbell mmap export desc */
+    /* RDMA Doorbell — Host doorbell mmap export desc */
     void *doorbell_export_desc;
     uint64_t doorbell_export_desc_len;
 };
@@ -118,22 +118,22 @@ struct ucp_collective_msg {
     void *dst_rkey_buf_rail1;
     uint64_t dst_rkey_buf_len_rail1;
 
-    /* Phase 8: Cross-GVMI PCI export of dst (for GPU Direct Ring Send/Recv) */
+    /* Cross-GVMI PCI export of dst (for GPU Direct Ring Send/Recv) */
     void *dst_pci_export_buf;
     uint64_t dst_pci_export_buf_len;
 
-    /* Phase 9: Cross-GVMI PCI export of src (for GPU Direct step 0 Send) */
+    /* Cross-GVMI PCI export of src (for GPU Direct step 0 Send) */
     void *src_pci_export_buf;
     uint64_t src_pci_export_buf_len;
 
-    /* Phase 12.2: Dual-rail Cross-GVMI PCI export (rail1 = port 1)
+    /* Dual-rail Cross-GVMI PCI export (rail1 = port 1)
      * 0 ならシングルレール GPU Direct (現状互換) */
     void *dst_pci_export_buf_rail1;
     uint64_t dst_pci_export_buf_len_rail1;
     void *src_pci_export_buf_rail1;
     uint64_t src_pci_export_buf_len_rail1;
 
-    /* Phase 14: GPU flag completion sync
+    /* GPU flag completion sync
      *   flag_gpu_addr  = 0  ならフラグ書き込みなし (legacy パス)
      *   flag_gpu_addr != 0  なら DPU は AG 完了直後にこの GPU アドレスへ
      *                       flag_value (uint32) を RDMA Write で書き込む。
@@ -145,11 +145,11 @@ struct ucp_collective_msg {
     uint32_t flag_reserved;  /* keep struct 8-byte aligned */
 };
 
-/* Phase 14/15: GPU flag pool init message (ホスト→DPU、一回限り)
+/* GPU flag pool init message (ホスト→DPU、一回限り)
  *   flag pool の RDMA export (= ホスト GPU 上の int32 配列の rkey buf) を DPU に送る。
- *   Phase 14: DPU は doca_remote_mem_create で remote_mem として保持し、以降の AG
+ *   DPU は doca_remote_mem_create で remote_mem として保持し、以降の AG
  *     完了時に flag_gpu_addr (オフセット計算済み) へ inline RDMA Write する。
- *   Phase 15: flag pool が GPU memory 上にある場合、追加で Cross-GVMI PCI export
+ *   flag pool が GPU memory 上にある場合、追加で Cross-GVMI PCI export
  *     (doca_mmap_export_pci) を送る。DPU 側で doca_mmap_create_from_export で
  *     import して local_mmap_override 経由で GPU memory に直接 Write できる。 */
 struct ucp_init_flag_pool_msg {
@@ -160,7 +160,7 @@ struct ucp_init_flag_pool_msg {
     /* rail1 用 (dual-rail でホストが両方の dev で export した場合) */
     void    *rkey_buf_rail1;
     uint64_t rkey_buf_len_rail1;
-    /* Phase 15: Cross-GVMI PCI export (optional; 0 なら legacy RDMA rkey のみを使う) */
+    /* Cross-GVMI PCI export (optional; 0 なら legacy RDMA rkey のみを使う) */
     void    *pci_export_buf;
     uint64_t pci_export_buf_len;
     void    *pci_export_buf_rail1;
@@ -209,7 +209,7 @@ static inline size_t control_cmd_packed_len(const struct control_cmd *cmd)
         pack_len += cmd->ucp_collective.dst_rkey_buf_len_rail1;
         pack_len += cmd->ucp_collective.dst_pci_export_buf_len;
         pack_len += cmd->ucp_collective.src_pci_export_buf_len;
-        /* Phase 12.2 dual-rail PCI export */
+        /* dual-rail PCI export */
         pack_len += cmd->ucp_collective.dst_pci_export_buf_len_rail1;
         pack_len += cmd->ucp_collective.src_pci_export_buf_len_rail1;
         break;
@@ -220,7 +220,7 @@ static inline size_t control_cmd_packed_len(const struct control_cmd *cmd)
     case CONTROL_CMD_UCP_INIT_FLAG_POOL:
         pack_len += cmd->ucp_init_flag_pool.rkey_buf_len;
         pack_len += cmd->ucp_init_flag_pool.rkey_buf_len_rail1;
-        /* Phase 15: Cross-GVMI PCI export descriptors */
+        /* Cross-GVMI PCI export descriptors */
         pack_len += cmd->ucp_init_flag_pool.pci_export_buf_len;
         pack_len += cmd->ucp_init_flag_pool.pci_export_buf_len_rail1;
         break;
@@ -306,28 +306,28 @@ static inline doca_error_t  control_cmd_pack(struct control_cmd *cmd, size_t *pa
             memcpy(pack_head, cmd->ucp_collective.dst_rkey_buf_rail1, pack_len);
             *packed_cmd_len += pack_len;
         }
-        /* Phase 8: Cross-GVMI PCI export (dst) */
+        /* Cross-GVMI PCI export (dst) */
         pack_len = cmd->ucp_collective.dst_pci_export_buf_len;
         if (pack_len > 0) {
             pack_head = rdma_serialize_next_raw(&pack_tail, void, pack_len);
             memcpy(pack_head, cmd->ucp_collective.dst_pci_export_buf, pack_len);
             *packed_cmd_len += pack_len;
         }
-        /* Phase 9: Cross-GVMI PCI export (src) */
+        /* Cross-GVMI PCI export (src) */
         pack_len = cmd->ucp_collective.src_pci_export_buf_len;
         if (pack_len > 0) {
             pack_head = rdma_serialize_next_raw(&pack_tail, void, pack_len);
             memcpy(pack_head, cmd->ucp_collective.src_pci_export_buf, pack_len);
             *packed_cmd_len += pack_len;
         }
-        /* Phase 12.2: Dual-rail PCI export (dst rail1) */
+        /* Dual-rail PCI export (dst rail1) */
         pack_len = cmd->ucp_collective.dst_pci_export_buf_len_rail1;
         if (pack_len > 0) {
             pack_head = rdma_serialize_next_raw(&pack_tail, void, pack_len);
             memcpy(pack_head, cmd->ucp_collective.dst_pci_export_buf_rail1, pack_len);
             *packed_cmd_len += pack_len;
         }
-        /* Phase 12.2: Dual-rail PCI export (src rail1) */
+        /* Dual-rail PCI export (src rail1) */
         pack_len = cmd->ucp_collective.src_pci_export_buf_len_rail1;
         if (pack_len > 0) {
             pack_head = rdma_serialize_next_raw(&pack_tail, void, pack_len);
@@ -361,7 +361,7 @@ static inline doca_error_t  control_cmd_pack(struct control_cmd *cmd, size_t *pa
             memcpy(pack_head, cmd->ucp_init_flag_pool.rkey_buf_rail1, pack_len);
             *packed_cmd_len += pack_len;
         }
-        /* Phase 15: PCI export desc */
+        /* PCI export desc */
         pack_len = cmd->ucp_init_flag_pool.pci_export_buf_len;
         if (pack_len > 0) {
             pack_head = rdma_serialize_next_raw(&pack_tail, void, pack_len);
@@ -451,25 +451,25 @@ static inline doca_error_t control_cmd_unpack(void *packed_cmd, size_t packed_cm
             extended_mem += ctrl_cmd->ucp_collective.dst_rkey_buf_len_rail1;
             ptr += ctrl_cmd->ucp_collective.dst_rkey_buf_len_rail1;
         }
-        /* Phase 8: Cross-GVMI PCI export */
+        /* Cross-GVMI PCI export */
         if (ctrl_cmd->ucp_collective.dst_pci_export_buf_len > 0) {
             ctrl_cmd->ucp_collective.dst_pci_export_buf = ptr;
             extended_mem += ctrl_cmd->ucp_collective.dst_pci_export_buf_len;
             ptr += ctrl_cmd->ucp_collective.dst_pci_export_buf_len;
         }
-        /* Phase 9: src PCI export */
+        /* src PCI export */
         if (ctrl_cmd->ucp_collective.src_pci_export_buf_len > 0) {
             ctrl_cmd->ucp_collective.src_pci_export_buf = ptr;
             extended_mem += ctrl_cmd->ucp_collective.src_pci_export_buf_len;
             ptr += ctrl_cmd->ucp_collective.src_pci_export_buf_len;
         }
-        /* Phase 12.2: Dual-rail PCI export (dst rail1) */
+        /* Dual-rail PCI export (dst rail1) */
         if (ctrl_cmd->ucp_collective.dst_pci_export_buf_len_rail1 > 0) {
             ctrl_cmd->ucp_collective.dst_pci_export_buf_rail1 = ptr;
             extended_mem += ctrl_cmd->ucp_collective.dst_pci_export_buf_len_rail1;
             ptr += ctrl_cmd->ucp_collective.dst_pci_export_buf_len_rail1;
         }
-        /* Phase 12.2: Dual-rail PCI export (src rail1) */
+        /* Dual-rail PCI export (src rail1) */
         if (ctrl_cmd->ucp_collective.src_pci_export_buf_len_rail1 > 0) {
             ctrl_cmd->ucp_collective.src_pci_export_buf_rail1 = ptr;
             extended_mem += ctrl_cmd->ucp_collective.src_pci_export_buf_len_rail1;
@@ -498,7 +498,7 @@ static inline doca_error_t control_cmd_unpack(void *packed_cmd, size_t packed_cm
             extended_mem += ctrl_cmd->ucp_init_flag_pool.rkey_buf_len_rail1;
             ptr += ctrl_cmd->ucp_init_flag_pool.rkey_buf_len_rail1;
         }
-        /* Phase 15: PCI export desc */
+        /* PCI export desc */
         if (ctrl_cmd->ucp_init_flag_pool.pci_export_buf_len > 0) {
             ctrl_cmd->ucp_init_flag_pool.pci_export_buf = ptr;
             extended_mem += ctrl_cmd->ucp_init_flag_pool.pci_export_buf_len;
@@ -535,7 +535,7 @@ struct ucp_connect_host_dpu_notify_msg {
     /* Multi-Rail: DPU 側 2 番目のポートの接続記述子 */
     void *remote_ucp_worker_address_rail1;
     uint64_t remote_ucp_worker_address_len_rail1;
-    /* Phase 5 Step 4: DPU command slot export descriptor */
+    /* DPU command slot export descriptor */
     void *cmd_slot_export_desc;
     uint64_t cmd_slot_export_desc_len;
 };
@@ -675,7 +675,7 @@ doca_error_t run_mpi_tag_exchange_cmd(uint64_t rank, uint64_t world_size,
                                       void **recv_storage,
                                       size_t *recv_storage_len);
 
-/* Phase 15: 指定タグ版。Ring 1 init で Ring 0 init と異なるタグを使うことで
+/* 指定タグ版。Ring 1 init で Ring 0 init と異なるタグを使うことで
  * MPI メッセージの衝突を回避する。 */
 doca_error_t run_mpi_tag_exchange_cmd_tagged(uint64_t rank, uint64_t world_size,
                                              uint64_t src_rank, uint64_t dst_rank,

@@ -340,12 +340,10 @@ class ZeroOffload(object):
         def _alternate_post_backward_module_hook(module, inputs):
             module.ds_grads_remaining = 0
 
-            #print(f"Before Forward {module.__class__.__name__}")
 
             def _run_after_backward_hook(*unused):
                 module.ds_grads_remaining = module.ds_grads_remaining - 1
                 if module.ds_grads_remaining == 0:
-                    #print(f"After backward {module.__class__.__name__}")
                     self.post_sub_module_backward_function(module)
 
             def _run_before_forward_function(input):
@@ -382,7 +380,6 @@ class ZeroOffload(object):
 
     @torch.no_grad()
     def pre_sub_module_forward_function(self, sub_module):
-        #print_rank_0(f"pre sub module forward function: {sub_module.__class__.__name__}", force=True)
         _nvtx_name_s = _nvtx_name(sub_module)
         _nvtx_push(f"fwd:{_nvtx_name_s}")
         see_memory_usage(f"Before sub module function {sub_module.__class__.__name__}", force=False)

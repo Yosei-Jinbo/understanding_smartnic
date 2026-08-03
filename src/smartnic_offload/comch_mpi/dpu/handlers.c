@@ -952,7 +952,7 @@ static inline void phase14_write_flag(struct collective_worker_t *cw,
     *send_slot = flag_value;
 
     /* RDMA Write 発行 (rail0 を使用、4 バイト)。
-     * 注意: flag_pool_rmem は host 側 mmap (PCI_READ_WRITE 付) から export された
+     * flag_pool_rmem は host 側 mmap (PCI_READ_WRITE 付) から export された
      * rdma rkey で作成されている。GPU memory 上の flag でも Cross-GVMI で着地する。
      * AG dst の host_dst_rmem と同じパターン。 */
     struct doca_task_desc write_task;

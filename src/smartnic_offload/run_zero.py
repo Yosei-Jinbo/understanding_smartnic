@@ -194,8 +194,7 @@ def _sysfs_find_bdf_by_bus_only(bus_dec: int) -> str:
     /sys/bus/pci/devices/* の BDF を走査して、bus が一致するものを探す。
     例: bus_dec=101 -> bus_hex='65' -> '0000:65:00.0' 等を返す。
 
-    注意: 同一busに複数デバイスがある環境では曖昧になり得る。
-          その場合は NVML 経由を推奨。
+    同一 bus に複数デバイスがある環境では曖昧になり得る (その場合は NVML 経由を推奨)。
     """
     bus_hex = f"{bus_dec:02x}"
     cands = glob.glob(f"/sys/bus/pci/devices/*:{bus_hex}:*")
@@ -458,11 +457,6 @@ class StepTimeStats:
         print("=" * 80)
 
 
-def _print_all_comm_stats():
-    """通信/転送の時間・回数・バイトはコード内計測を廃止し nsys / DPU union tracker に一本化した。"""
-    pass
-
-
 def _train_step_normal(zero_model, loss_fn, inputs, timers, stats,
                        is_causal_lm, is_mlm):
     """通常経路: fwd → bwd → 同期 CPU Adam step (同一 step 内で反映)。"""
@@ -616,7 +610,7 @@ def run_zero(use_profiler=False,
         # (delayed parameter update) 経路。baseline と同じ環境変数で制御する。
         # デフォルト -1 = 全エポック DPU (従来の smartnic_offload の挙動)。
         # 例: DPU_THRESHOLD=7 → epoch 0-7 通常 / 8以降 DPU。常時通常なら十分大きい値を指定。
-        dpu_threshold = int(os.environ.get("DPU_THRESHOLD", "-1"))
+        dpu_threshold = int(os.environ.get("DPU_THRESHOLD", "100000000"))
 
         global_iter = 0
 
@@ -764,7 +758,6 @@ def run_zero(use_profiler=False,
                                 torch.cuda.synchronize()
                             except Exception:
                                 pass
-                            _print_all_comm_stats()
                             sys.stdout.flush()
                         torch.cuda.profiler.stop()
                     if total_target_iters is not None and global_iter >= total_target_iters:
@@ -817,7 +810,6 @@ def run_zero(use_profiler=False,
 
         if rank == 0:
             stats.print_all()
-            _print_all_comm_stats()
 
             try:
                 print(memory_usage_rank(model, optimizer=optimizer))

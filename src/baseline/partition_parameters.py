@@ -1,6 +1,5 @@
 import sys
 import os
-import argparse
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from common.utils import logger
 
@@ -13,7 +12,6 @@ import itertools
 from typing import List
 
 import time
-import threading
 
 import torch
 from torch import Tensor
@@ -25,12 +23,6 @@ from stage3_utils import * #parameterの持ち方が違うため独自のmemory_
 # H2D/D2H の転送時間は CUDA Event ベースの計測 (_accumulate_* 系) で取得する。
 
 
-
-# ---- Completion poller gate (CUPTI/nsys との衝突回避用) ----
-# DISABLE_COMPLETION_POLLER=1 で _NcclCompletionPoller を抑止。poller は別スレッドから
-# cudaEventQuery を高頻度に叩き、nsys の CUPTI hook と干渉して SIGSEGV を起こすことがある。
-# 無効化すると block_ms / dpu_ms の detailed 統計は取れないが学習の正しさには影響しない。
-_DISABLE_COMPLETION_POLLER = os.environ.get("DISABLE_COMPLETION_POLLER", "0") == "1"
 
 class PartitionedParamStatus(Enum):
     # Partitioned parameters are present and ready for use
@@ -81,139 +73,6 @@ def get_param_shard_h2d_time_ms() -> float:
 def get_param_shard_h2d_calls() -> int:
     return int(PARAM_SHARD_H2D_CALLS)
 
-# ---- parameter all_gather の通信時間集計 (CUDA event based, per-rank ms) ----
-ALL_GATHER_CALLS: int = 0
-ALL_GATHER_DPU_MS: float = 0.0        # 通信処理時間 (キュー待ち除去) の累計
-ALL_GATHER_BLOCK_MS: float = 0.0      # ブロック時間の累計
-ALL_GATHER_BYTES: int = 0
-ALL_GATHER_LAST_COMPLETE: float = 0.0
-ALL_GATHER_LOCK = threading.Lock()
-
-def _accumulate_all_gather_detailed(t_request: float, t_complete: float, block_ms: float, nbytes: int = 0) -> None:
-    global ALL_GATHER_CALLS, ALL_GATHER_DPU_MS, ALL_GATHER_BLOCK_MS, ALL_GATHER_BYTES, ALL_GATHER_LAST_COMPLETE
-    with ALL_GATHER_LOCK:
-        dpu_start = max(t_request, ALL_GATHER_LAST_COMPLETE)
-        dpu_ms = (t_complete - dpu_start) * 1000.0
-        if dpu_ms < 0:
-            dpu_ms = 0.0
-        ALL_GATHER_DPU_MS += dpu_ms
-        ALL_GATHER_BLOCK_MS += float(block_ms)
-        ALL_GATHER_BYTES += nbytes
-        ALL_GATHER_LAST_COMPLETE = t_complete
-        ALL_GATHER_CALLS += 1
-
-def get_all_gather_calls() -> int:
-    return int(ALL_GATHER_CALLS)
-
-def get_all_gather_dpu_ms() -> float:
-    return float(ALL_GATHER_DPU_MS)
-
-def get_all_gather_block_ms() -> float:
-    return float(ALL_GATHER_BLOCK_MS)
-
-def get_all_gather_bytes() -> int:
-    return int(ALL_GATHER_BYTES)
-
-# ---- Forward / Backward AG block tracking ----
-_AG_PHASE = "unknown"
-_AG_FWD_BLOCK_MS: float = 0.0
-_AG_BWD_BLOCK_MS: float = 0.0
-_AG_FWD_CALLS: int = 0
-_AG_BWD_CALLS: int = 0
-
-def set_ag_phase(phase: str) -> None:
-    global _AG_PHASE
-    _AG_PHASE = phase
-
-def _accumulate_phase_block(block_ms: float) -> None:
-    global _AG_FWD_BLOCK_MS, _AG_BWD_BLOCK_MS, _AG_FWD_CALLS, _AG_BWD_CALLS
-    if _AG_PHASE == "forward":
-        _AG_FWD_BLOCK_MS += block_ms
-        _AG_FWD_CALLS += 1
-    elif _AG_PHASE == "backward":
-        _AG_BWD_BLOCK_MS += block_ms
-        _AG_BWD_CALLS += 1
-
-def get_ag_phase_stats() -> dict:
-    return {
-        "fwd_block_ms": _AG_FWD_BLOCK_MS, "fwd_calls": _AG_FWD_CALLS,
-        "bwd_block_ms": _AG_BWD_BLOCK_MS, "bwd_calls": _AG_BWD_CALLS,
-    }
-
-def reset_ag_phase_stats() -> None:
-    global _AG_FWD_BLOCK_MS, _AG_BWD_BLOCK_MS, _AG_FWD_CALLS, _AG_BWD_CALLS
-    _AG_FWD_BLOCK_MS = _AG_BWD_BLOCK_MS = 0.0
-    _AG_FWD_CALLS = _AG_BWD_CALLS = 0
-
-# ---- Per-AG detailed records for size-based analysis ----
-_AG_RECORDS: list = []
-_AG_RECORDS_LOCK = threading.Lock()
-
-def _record_ag_detail(nbytes: int, dpu_ms: float, block_ms: float,
-                      enqueue_ms: float = 0.0, prefetch_lead_ms: float = 0.0,
-                      wall_ms: float = 0.0) -> None:
-    with _AG_RECORDS_LOCK:
-        _AG_RECORDS.append((nbytes, dpu_ms, block_ms, enqueue_ms, prefetch_lead_ms, wall_ms))
-
-def print_ag_analysis(epoch: int) -> None:
-    with _AG_RECORDS_LOCK:
-        records = list(_AG_RECORDS)
-    if not records:
-        return
-    buckets = [
-        ("<1KB",   0,        1024),
-        ("1-16KB", 1024,     16384),
-        ("16K-1M", 16384,    1048576),
-        ("1-16MB", 1048576,  16777216),
-        (">16MB",  16777216, float('inf')),
-    ]
-    print(f"========== Per-AG Analysis (Epoch {epoch}) ==========", flush=True)
-    print(f"  AG calls: {len(records)}", flush=True)
-    for label, lo, hi in buckets:
-        group = [(nb, dpu, blk, enq, pfl, wl) for nb, dpu, blk, enq, pfl, wl in records if lo <= nb < hi]
-        if not group:
-            continue
-        n = len(group)
-        avg_dpu = sum(d for _, d, _, _, _, _ in group) / n
-        avg_blk = sum(b for _, _, b, _, _, _ in group) / n
-        avg_pfl = sum(p for _, _, _, _, p, _ in group) / n
-        avg_wl  = sum(w for _, _, _, _, _, w in group) / n
-        avg_sz  = sum(s for s, _, _, _, _, _ in group) / n
-        p99_blk = sorted(b for _, _, b, _, _, _ in group)[int(n * 0.99)] if n > 1 else avg_blk
-        p99_wl  = sorted(w for _, _, _, _, _, w in group)[int(n * 0.99)] if n > 1 else avg_wl
-        print(f"  {label:>7s}: calls={n:>6d} | avg_size={avg_sz/1024:.1f}KB | "
-              f"comm={avg_dpu:.3f}ms | block={avg_blk:.3f}ms (p99={p99_blk:.3f}ms) | "
-              f"wall={avg_wl:.3f}ms (p99={p99_wl:.3f}ms) | "
-              f"prefetch_lead={avg_pfl:.1f}ms", flush=True)
-    top_block = sorted(records, key=lambda r: r[2], reverse=True)[:10]
-    print(f"  Top 10 blocking AGs:", flush=True)
-    for nb, dpu, blk, enq, pfl, wl in top_block:
-        print(f"    size={nb/1024:.1f}KB | comm={dpu:.3f}ms | block={blk:.3f}ms | wall={wl:.3f}ms | prefetch_lead={pfl:.1f}ms", flush=True)
-    print(f"{'=' * 55}", flush=True)
-
-def reset_ag_records() -> None:
-    with _AG_RECORDS_LOCK:
-        _AG_RECORDS.clear()
-
-class _NcclCompletionPoller:
-    """NCCL Work の is_completed() をポーリングして完了時刻を検知する"""
-    _POLL_INTERVAL = 0.0001  # 100μs
-
-    def __init__(self, handle):
-        self._handle = handle
-        self.t_complete = None
-        self._thread = threading.Thread(target=self._poll, daemon=True)
-        self._thread.start()
-
-    def _poll(self):
-        while not self._handle.is_completed():
-            time.sleep(self._POLL_INTERVAL)
-        self.t_complete = time.perf_counter()
-
-    def join(self):
-        self._thread.join()
-
-
 def allgather_fn(output_tensor: torch.Tensor,
                  input_tensor: torch.Tensor,
                  group=None,
@@ -252,7 +111,7 @@ def allgather_fn(output_tensor: torch.Tensor,
     # 3) 最後の手段：リスト版 all_gather（遅い・Pythonオーバーヘッド有り）
     # output_tensor を world_size 個に分割して受け皿にする
     chunks = list(torch.chunk(output_tensor, world_size, dim=0))
-    # 注意: async_op=True のとき Work が返る。False のときは None。
+    # async_op=True のとき Work が返る。False のときは None。
     return dist.all_gather(
         chunks, input_tensor, group=group, async_op=async_op
     )
@@ -537,30 +396,8 @@ class AllGatherHandle:
             raise RuntimeError(f"expected param {param.ds_summary()} to be available")
         self.__handle = handle
         self.__param = param
-        self.__t_request = t_request
-        self.__use_poller = (
-            t_request is not None
-            and hasattr(handle, 'is_completed')
-            and not _DISABLE_COMPLETION_POLLER
-        )
 
     def wait(self) -> None:
-        t_wait_start = time.perf_counter()
-
-        if self.__use_poller:
-            poller = _NcclCompletionPoller(self.__handle)
-            poller.join()
-            t_complete = poller.t_complete or time.perf_counter()
-            block_ms = (t_complete - t_wait_start) * 1000.0
-            nbytes = self.__param.ds_numel * self.__param.element_size()
-            comm_start = max(self.__t_request, ALL_GATHER_LAST_COMPLETE)
-            comm_ms = (t_complete - comm_start) * 1000.0
-            prefetch_lead_ms = (t_wait_start - self.__t_request) * 1000.0
-            wall_ms = (t_complete - self.__t_request) * 1000.0
-            _accumulate_all_gather_detailed(self.__t_request, t_complete, block_ms, nbytes)
-            _record_ag_detail(nbytes, max(0.0, comm_ms), block_ms, 0.0, prefetch_lead_ms, wall_ms)
-            _accumulate_phase_block(block_ms)
-
         instrument_w_nvtx(self.__handle.wait)()
         self.__param.ds_status = ZeroParamStatus.AVAILABLE
 
@@ -570,13 +407,7 @@ class AllGatherCoalescedHandle:
         self.__params = params
         self.__partitions = partitions
         self.__world_size = world_size
-        self.__t_request = t_request
         self.__complete = False
-        self.__use_poller = (
-            t_request is not None
-            and hasattr(allgather_handle, 'is_completed')
-            and not _DISABLE_COMPLETION_POLLER
-        )
         for param in self.__params:
             if param.ds_status != ZeroParamStatus.INFLIGHT:
                 raise RuntimeError(
@@ -586,24 +417,8 @@ class AllGatherCoalescedHandle:
     def wait(self) -> None:
         if self.__complete:
             return
-        t_wait_start = time.perf_counter()
-
-        if self.__use_poller:
-            poller = _NcclCompletionPoller(self.__allgather_handle)
-            poller.join()
-            t_complete = poller.t_complete or time.perf_counter()
-            block_ms = (t_complete - t_wait_start) * 1000.0
-            nbytes = sum(p.ds_numel * p.element_size() for p in self.__params)
-            comm_start = max(self.__t_request, ALL_GATHER_LAST_COMPLETE)
-            comm_ms = (t_complete - comm_start) * 1000.0
-            prefetch_lead_ms = (t_wait_start - self.__t_request) * 1000.0
-            wall_ms = (t_complete - self.__t_request) * 1000.0
-            _accumulate_all_gather_detailed(self.__t_request, t_complete, block_ms, nbytes)
-            _record_ag_detail(nbytes, max(0.0, comm_ms), block_ms, 0.0, prefetch_lead_ms, wall_ms)
-            _accumulate_phase_block(block_ms)
 
         instrument_w_nvtx(self.__allgather_handle.wait)()
-        self.__t_request = None
 
         param_offset = 0
         for param in self.__params:
