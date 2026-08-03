@@ -1106,7 +1106,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         flat_tensor = torch.zeros(aligned_param_size, dtype=param.dtype, device=param.device).view(-1)
         
         see_memory_usage(f'After allocate allgather param {debug_param2name_id_shape_status(param)} {aligned_param_size} {partition_size} ', force=False)
-        torch.cuda.synchronize() #単一プロセスでの同期, GPU kernelが終わるまではCPU実行を止める (torch.distributed.barrier()は複数プロセスのバリア同期)
+        #torch.cuda.synchronize() #単一プロセスでの同期, GPU kernelが終わるまではCPU実行を止める (torch.distributed.barrier()は複数プロセスのバリア同期)
         print_rank_0(f"{'--'* hierarchy}----allgather param with {debug_param2name_id_shape_status(param)} partition size={partition_size}")
         #_all_gather_base は出力をリストでなく 1 本のフラットテンソルに直接書くため高速・低オーバーヘッド
         handle = dist.all_gather_base(flat_tensor, param.ds_tensor.cuda(), group=self.ds_process_group, async_op=async_op)

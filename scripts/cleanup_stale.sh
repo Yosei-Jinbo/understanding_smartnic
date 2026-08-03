@@ -161,7 +161,7 @@ if [ "$DO_DPU" = 1 ]; then
   echo
   echo "※ DPU を落としました。再測定前に dpu_appfile で起動し直してください:"
   echo "   cd src/smartnic_offload/comch_mpi/dpu"
-  echo "   export COMM_CORES=2 COMPUTE_CORES=8 AG_PIECE_MAX=8 RS_PREPOST=1 FORCE_STAGING=0 FORCE_SINGLE_RAIL=1"
+  echo "   # env 不要 (既定: COMM_CORES=2 COMPUTE_CORES=8 AG_PIECE_MAX=8 RS_PREPOST=1 FORCE_STAGING=0 FORCE_SINGLE_RAIL=0)"
   echo "   mpirun --bind-to none --app dpu_appfile 2>&1 | tee /tmp/dpu_<model>_<cfg>.log"
   echo "   # 起動ログの core alloc 行が **4 ランクすべて** 出ることを確認"
 fi

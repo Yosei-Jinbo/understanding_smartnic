@@ -5,7 +5,7 @@
 # 事前準備:
 #   1. 両 DPU 側で先にサーバを起動しておくこと (host 側は接続待ちでブロックする):
 #        dpu$ cd src/smartnic_offload/comch_mpi/dpu
-#        dpu$ mpirun --app dpu_appfile
+#        dpu$ mpirun --bind-to none --app dpu_appfile
 #   2. NCCL 経路 (nccl_rs / nccl_ag / all) を使う場合は MASTER_ADDR / MASTER_PORT を
 #      export しておくこと (appfile が -x で全 rank に配る)。
 #
@@ -42,7 +42,7 @@ sed -e "s/\$/ --run $RUN $EXTRA_ARGS/" "$BASE_APPFILE" > "$RUN_APPFILE"
 
 echo "[run_collective_benchmark] generated appfile: $RUN_APPFILE"
 LOG="$SCRIPT_DIR/logs/collective_benchmark_${RUN}_$(date +%Y%m%d_%H%M%S).log"
-mpirun --app "$RUN_APPFILE" 2>&1 | tee "$LOG"
+mpirun --bind-to none --app "$RUN_APPFILE" 2>&1 | tee "$LOG"
 
 echo ""
 echo "[done] 結果はログを参照 ($LOG)"

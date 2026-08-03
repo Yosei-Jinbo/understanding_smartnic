@@ -7,7 +7,7 @@
 # 事前準備: 両 DPU 側で先にサーバを起動しておくこと
 # (host 側は接続待ちでブロックする):
 #
-#   dpu$ cd comch_mpi/dpu && mpirun --app dpu_appfile
+#   dpu$ cd comch_mpi/dpu && mpirun --bind-to none --app dpu_appfile
 #
 # 使い方
 # (どちらかのホストで1回だけ実行。mpirunが4 rankすべてを起動する):
@@ -215,7 +215,7 @@ echo ""
 echo "[run_vit_accuracy] start"
 echo ""
 
-mpirun --app "$ACC_APPFILE" 2>&1 | tee "$LOG"
+mpirun --bind-to none --app "$ACC_APPFILE" 2>&1 | tee "$LOG"
 
 MPI_STATUS=${PIPESTATUS[0]}
 

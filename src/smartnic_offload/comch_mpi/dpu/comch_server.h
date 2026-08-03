@@ -46,7 +46,7 @@ typedef _Float16 fp16_t;
 extern int g_comm_cores;        /* COMM_CORES:    通信 progress の rank あたりコア数 C */
 extern int g_compute_cores;     /* COMPUTE_CORES: 計算 RS 集約スレッド数 K (rank 共有) */
 extern int g_force_staging;     /* FORCE_STAGING:     AG の GPU 直接アクセスを無効化 (ablation) */
-extern int g_force_single_rail; /* FORCE_SINGLE_RAIL: AG の dual-rail を無効化 (default 1) */
+extern int g_force_single_rail; /* FORCE_SINGLE_RAIL: AG の dual-rail を無効化 (default 0=dual) */
 extern int g_rs_prepost;        /* RS_PREPOST:        RS の Recv 先行 post (default 1) */
 
 /* 3 progress worker を C コアに packing（rank 分離） */

@@ -45,10 +45,10 @@ int g_compute_cores = COMPUTE_CORES_DEFAULT;
  * host_dst_rmem/host_src_rmem 経由の RDMA staging 経路に落とす（gpu_direct を強制 off）。
  * RS には影響させない（RS は reduction のため常に DPU に取り込むので staging の概念が無い）。 */
 int g_force_staging = 0;
-/* AG の rail 選択。既定は single-rail（実測で dual≈single、律速は DPU↔GPU の cross-GVMI DMA
- * 経路で通信並列度は効かないため single を採用）。dual-rail コードは残しており、
- * FORCE_SINGLE_RAIL=0 で dual を有効化できる。 */
-int g_force_single_rail = 1;
+/* AG の rail 選択。既定は dual-rail (nsys 実測: single 化すると AG 帯域が半減し
+ * OPT で fwd +116ms/step の AG 待ち増になる)。FORCE_SINGLE_RAIL=1 で single に
+ * 切り替え可能 (rail スケーリング比較用)。 */
+int g_force_single_rail = 0;
 /* RS の Recv 先行 post（pre-post）。1 なら全 step の Recv をループ前に一括 post する。
  *
  * これは **チャンク分割とは独立の最適化** である。両者を 1 つのフラグで束ねていた時期があり、
@@ -68,7 +68,7 @@ static void core_alloc_init_from_env(void)
     if (c) { int v = atoi(c); if (v >= 1 && v <= (int)DOCA_WORKER_TYPE_COUNT) g_comm_cores = v; }
     if (k) { int v = atoi(k); if (v >= 1) g_compute_cores = v; }
     g_force_staging = (fs && atoi(fs) != 0) ? 1 : 0;
-    /* FORCE_SINGLE_RAIL: 未設定なら既定(1=single)を維持。設定時のみ上書き(0=dual,1=single)。 */
+    /* FORCE_SINGLE_RAIL: 未設定なら既定(0=dual)を維持。設定時のみ上書き(0=dual,1=single)。 */
     if (sr) g_force_single_rail = (atoi(sr) != 0) ? 1 : 0;
     /* RS_PREPOST: 未設定なら既定(1=有効)を維持。設定時のみ上書き。 */
     if (pp) g_rs_prepost = (atoi(pp) != 0) ? 1 : 0;

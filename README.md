@@ -19,6 +19,8 @@ The SmartNIC offloading mechanism consists of a host-side component (loaded by t
 ```bash
 cd src/smartnic_offload/comch_mpi/host
 USE_MARCH_NATIVE=1 USE_LTO=1 python3 setup.py build_ext --inplace
+
+source scripts/export.sh
 ```
 
 ### DPU side
