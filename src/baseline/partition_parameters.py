@@ -901,6 +901,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                     _shards.append(_tmp)
 
                 # synchronize once, then accumulate per-shard elapsed time
+                # (elapsed_time は両イベント完了が必須。外すと RuntimeError になる)
                 if _ev_pairs:
                     torch.cuda.synchronize()
                     for (_st, _ed) in _ev_pairs:

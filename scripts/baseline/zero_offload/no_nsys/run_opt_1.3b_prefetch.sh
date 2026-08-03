@@ -25,7 +25,7 @@ torchrun \
     --dataset wikitext-103 \
     --batch-size 2 \
     --warmup-iters 10 \
-    --measure-iters 30 \
+    --measure-iters 20 \
     --seq-len 1024 \
     --reduce-bucket-size 5e8 \
     --prefetch-bucket-size 5e8 \

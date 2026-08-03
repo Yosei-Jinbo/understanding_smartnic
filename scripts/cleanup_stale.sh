@@ -56,7 +56,7 @@ nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader 2>/dev/nul
   && echo "    (compute プロセスなし)"
 echo "  [残留プロセス]"
 found=0
-for pat in 'run_zero_mpi\.py' 'nsight-systems' 'nsys profile' 'prted' 'orted' 'host_appfile'; do
+for pat in 'run_zero\.py' 'run_zero_mpi\.py' 'torchrun' 'nsight-systems' 'nsys profile' 'prted' 'orted' 'host_appfile'; do
   pids=$(pgrep -f "$pat" 2>/dev/null)
   for p in $pids; do
     [ "$p" = "$$" ] && continue
@@ -69,11 +69,16 @@ done
 echo "  [/dev/shm]"
 ls /dev/shm 2>/dev/null | grep -i -E 'nsys|nsight' | sed 's/^/    /' || true
 ls /dev/shm 2>/dev/null | grep -qi -E 'nsys|nsight' || echo "    (なし)"
+echo "  [torch_extensions ビルドロック]"
+# Ctrl-C で殺された DeepSpeedCPUAdam 初期化がロックを残すと、次回の
+# CPUAdam warmup がロック待ちで無限ハングする (start は出るが done が出ない)
+locks=$(find ~/.cache/torch_extensions -name lock 2>/dev/null)
+if [ -n "$locks" ]; then echo "$locks" | sed 's/^/    ★/'; else echo "    (なし)"; fi
 PAYLOAD
 
 read -r -d '' KILL_PAYLOAD <<'PAYLOAD'
 set -u
-for pat in 'run_zero_mpi\.py' 'nsight-systems' 'nsys profile' 'prted' 'orted' 'host_appfile'; do
+for pat in 'run_zero\.py' 'run_zero_mpi\.py' 'torchrun' 'nsight-systems' 'nsys profile' 'prted' 'orted' 'host_appfile'; do
   pids=$(pgrep -f "$pat" 2>/dev/null)
   for p in $pids; do
     [ "$p" = "$$" ] && continue
@@ -81,6 +86,10 @@ for pat in 'run_zero_mpi\.py' 'nsight-systems' 'nsys profile' 'prted' 'orted' 'h
   done
 done
 rm -f /dev/shm/sem.NSys-* /dev/shm/nsys* /dev/shm/NSys* 2>/dev/null
+# stale な torch_extensions ロックを削除 (直前で全プロセスを殺しているので安全)
+for lk in $(find ~/.cache/torch_extensions -name lock 2>/dev/null); do
+  rm -f "$lk" && echo "    removed lock: $lk"
+done
 # GPU が解放されるまで待つ（プロセス消滅とドライバの解放にはラグがある）
 for i in $(seq 1 20); do
   left=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | wc -l)

@@ -616,7 +616,7 @@ def run_zero(use_profiler=False,
         # (delayed parameter update) 経路。baseline と同じ環境変数で制御する。
         # デフォルト -1 = 全エポック DPU (従来の smartnic_offload の挙動)。
         # 例: DPU_THRESHOLD=7 → epoch 0-7 通常 / 8以降 DPU。常時通常なら十分大きい値を指定。
-        dpu_threshold = int(os.environ.get("DPU_THRESHOLD", "100000000"))
+        dpu_threshold = int(os.environ.get("DPU_THRESHOLD", "-1"))
 
         global_iter = 0
 
@@ -677,14 +677,15 @@ def run_zero(use_profiler=False,
                     # ホスト C 側に登録 → DPU に INIT_FLAG_POOL を送信
                     try:
                         import doca_comch_client_pybind as _dcp
-                        _dcp.comch_register_flag_pool_py(pool.base_addr, pool.total_bytes)
+                        _dcp.register_flag_pool_py(pool.base_addr, pool.total_bytes)
                     except Exception as _re:
                         if rank == 0:
-                            print(f"[FlagPool] comch_register_flag_pool_py failed: {_re} (disabling)")
+                            print(f"[FlagPool] register_flag_pool_py failed: {_re} (disabling)")
                         _gfp.set_global_pool(None)
                     else:
                         if rank == 0:
-                            print(f"[FlagPool] GPU flag wait enabled: size={pool.size} addr=0x{pool.base_addr:x} storage=pinned host")
+                            _storage = "GPU memory (Cross-GVMI)" if pool.on_gpu else "pinned host"
+                            print(f"[FlagPool] GPU flag wait enabled: size={pool.size} addr=0x{pool.base_addr:x} storage={_storage}")
             except Exception as _e:
                 if rank == 0:
                     print(f"[FlagPool] init failed: {_e}")

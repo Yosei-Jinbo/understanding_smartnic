@@ -51,7 +51,7 @@ run_prefetch() {
   STEP_NVTX=1 \
   DISABLE_COMPLETION_POLLER=1 \
   DISABLE_ADAM_FORK=1 \
-  NSYS_PROFILE_MEASURE_ITERS=25 \
+  NSYS_PROFILE_MEASURE_ITERS=15 \
   NSYS_SYNC_RANGES=1 \
   NCCL_SOCKET_IFNAME=enp207s0f0np0,enp207s0f1np1 \
   NCCL_IB_DISABLE=0 \
@@ -71,7 +71,7 @@ run_prefetch() {
       --dataset "$DATASET" \
       --batch-size "$BATCH_SIZE" \
       --warmup-iters 5 \
-      --measure-iters 30 \
+      --measure-iters 20 \
       "${SEQ_ARGS[@]}" \
       --reduce-bucket-size "$RB" \
       --prefetch-bucket-size "$PB" \

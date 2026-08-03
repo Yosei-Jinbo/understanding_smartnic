@@ -158,6 +158,9 @@ _flag_keepalive_q = collections.deque()  # (slot_id, gen, keep_alive)
 
 
 def _sweep_flag_keepalive(pool) -> None:
+    if not _flag_keepalive_q:
+        return
+    pool.refresh_flags()  # GPU 配置時: flag スナップショットを更新 (host 配置時 no-op)
     while _flag_keepalive_q:
         slot_id, gen, _ka = _flag_keepalive_q[0]
         if pool.flag_reached(slot_id, gen):
@@ -1057,7 +1060,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         flat_tensor = torch.zeros(aligned_param_size, dtype=param.dtype, device=param.device).view(-1)
         
         see_memory_usage(f'After allocate allgather param {debug_param2name_id_shape_status(param)} {aligned_param_size} {partition_size} ', force=False)
-        torch.cuda.synchronize() #単一プロセスでの同期, GPU kernelが終わるまではCPU実行を止める (torch.distributed.barrier()は複数プロセスのバリア同期)
+        #torch.cuda.synchronize() #単一プロセスでの同期, GPU kernelが終わるまではCPU実行を止める (torch.distributed.barrier()は複数プロセスのバリア同期)
         print_rank_0(f"{'--'* hierarchy}----allgather param with {debug_param2name_id_shape_status(param)} partition size={partition_size}")
         # ===== ここを PyTorch → DOCA に差し替え =====
         input_tensor = param.ds_tensor

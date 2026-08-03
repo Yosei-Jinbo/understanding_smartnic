@@ -583,7 +583,7 @@ def run_zero(use_profiler=False, use_bf16=False, use_ema=False,
 
         # このエポック以下は正常経路 (同期 step)、超えたら DPU (delayed parameter update) 経路。
         # 既定 10**9 = 全エポック通常経路。環境変数で上書き可能 (例: DPU_THRESHOLD=-1 で全エポック DPU)。
-        dpu_threshold = int(os.environ.get("DPU_THRESHOLD", "1000000000"))
+        dpu_threshold = int(os.environ.get("DPU_THRESHOLD", "-1"))
         if no_offload:
             # 純粋 ZeRO-3 (GPU) モード: CPU Adam worker がないため DPU は使えない。
             if "DPU_THRESHOLD" in os.environ:
