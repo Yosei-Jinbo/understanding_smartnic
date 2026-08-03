@@ -839,18 +839,7 @@ void execute_doca_init_flag_pool_cmd(struct control_cmd *recv_cmd, struct comch_
         }
     }
 
-    /* ---- Cross-GVMI PCI import (optional) ----
-     *   host が pci_export_buf を送ってきていれば、そちらを local mmap として
-     *   import する。phase14_write_flag はこれを local_mmap_override として
-     *   使い、GPU memory に PCIe 経由で直接 Write する。
-     *
-     *   重要: ring_dev と rdma_dev のどちらを使うかは用途によるが、既存の
-     *   GPU dst PCI import は ring_dev を使っている。同じパターンに合わせる。
-     *   ただしここで問題は: rdma_rma ctx は rdma_dev で作られており、
-     *   ring_dev の local mmap とはデバイスが違う。
-     *
-     *   → 最小変更方針: rdma_dev で import する (rdma_rma ctx と整合)。
-     *      ring_dev import は不要 (phase14_write_flag は rdma_rma を使うため)。 */
+    /* ---- Cross-GVMI PCI import (optional) ---- */
     cw->flag_pool_pci_mmap = NULL;
     cw->flag_pool_pci_mmap_rail1 = NULL;
     cw->flag_pool_pci_enabled = false;

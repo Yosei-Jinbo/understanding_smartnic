@@ -46,10 +46,7 @@ def print_rank_0(message: str):
         logger.info(message)
 
 
-# ---- ステップ内訳 NVTX (STEP_NVTX=1 で有効) ----
-# compute_idle_decomp の "Other"(=host_overhead) に丸め込まれている区間を細分するための計装。
-# 査読 C3「Fig.7 の Other を SM 競合緩和とホスト/起動オーバーヘッドに分離できるか」に対応。
-# xfer: 系 (XFER_NVTX) とは独立にゲートする。
+# ---- ステップ内訳 NVTX (STEP_NVTX=1 で有効): compute_idle_decomp の "Other" 区間を細分する計装 ----
 _STEP_NVTX = os.environ.get("STEP_NVTX", "0") == "1"
 
 
@@ -136,8 +133,8 @@ def set_seed(seed: int, rank: int):
 def dump_final_params(model, rank: int, path_prefix: str):
     """訓練後の各パラメータのローカルシャード (ds_tensor) を ds_id 順に連結し、
     ビット再現性検証用に <path_prefix>.rank<rank>.pt へ保存 + sha256 を表示する。
-    _DmaCompletionPoller 削除のような「数値に影響しないはずの変更」の前後で、
-    このハッシュが完全一致することを確認するためのもの。"""
+    数値に影響しないはずの変更の前後で、このハッシュが完全一致することを
+    確認するためのもの。"""
     import hashlib
     shards = []
     for p in sorted(model.parameters(), key=lambda x: getattr(x, "ds_id", -1)):
@@ -254,7 +251,6 @@ def _build_datasets(model_name, dataset_name, batch_size, num_workers, seq_len,
             batch_size,
             num_workers,
             resize_to_imagenet=True, #ViT用
-            #resize_to_imagenet=False, #ResNet用
         )
     return train_dataset, test_dataset
 
@@ -470,18 +466,9 @@ def _train_step_dpu(zero_model, loss_fn, inputs, timers, stats,
 
 @torch.no_grad()
 def _evaluate_testset(zero_model, test_loader, device, loss_fn, is_causal_lm, is_mlm):
-    """test_loader でテストセット全体を評価し (loss, accuracy) を返す。
-    ZeRO-3 では forward が param を all-gather する。no_grad 中は
-    _end_of_forward_hook が推論用 coordinator を各 forward 後に reset するため、
-    訓練用 coordinator の trace は壊れない。all_reduce(SUM) は test_loader が
-    rank 分割済みでも複製でも正しい平均を返す (分子分母とも同じ倍率で相殺)。
-
-    accuracy の定義:
-      画像分類     : サンプル単位の top-1 正答率。
-      causal LM    : 次トークン予測のトークン精度 (logits[:, :-1] を labels[:, 1:] と
-                     比較。labels==-100 の位置は無視)。loss/精度ともトークン重み平均。
-      MLM          : マスク位置のトークン精度 (labels!=-100 の位置のみ)。
-    """
+    """テストセット全体を評価し (loss, accuracy) を返す。no_grad 中は推論用 coordinator が
+    forward 後に reset されるため訓練用 trace は壊れない。accuracy は画像=top-1、
+    causal LM=次トークン精度、MLM=マスク位置精度 (labels==-100 は無視)。"""
     zero_model.eval()
     correct = 0.0
     loss_sum = 0.0
@@ -523,21 +510,16 @@ def _evaluate_testset(zero_model, test_loader, device, loss_fn, is_causal_lm, is
 
 
 def _build_lr_scheduler(optimizer, use_ema, lr_decay):
-    """--ema / --lr-decay 指定時に ExponentialLR を構築する (未指定なら None)。
-    長期学習向けの既定 gamma=0.95 (10 epoch で ×0.63 / 30 epoch で ×0.21 /
-    50 epoch で ×0.08)。DPU (遅延1step更新) の精度ダメージは lr に比例するため、
-    減衰が進み切替時点の lr が十分小さくなっていることが崩落回避に効く。
-    スケジュール計算は ExponentialLR (親プロセスの optimizer.param_groups) が行い、
-    実際に step する worker プロセスの Adam へは set_lr で毎エポック転送する。"""
+    """--ema / --lr-decay 指定時に ExponentialLR を構築 (未指定なら None、既定 gamma=0.95)。
+    DPU (遅延1step更新) の精度ダメージは lr に比例するため減衰が崩落回避に効く。
+    スケジュール計算は親の carrier optimizer で行い、worker へは set_lr で毎エポック転送する。"""
     if not use_ema and lr_decay == 1.0:
         return None
     _gamma = lr_decay if lr_decay != 1.0 else 0.95
     lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=_gamma)
     print_rank_0(f"[LR] ExponentialLR gamma={_gamma}")
-    # optimizer は設定キャリアで .step() は一度も呼ばれない (実更新は
-    # worker / GPU Adam)。param_groups は空なのでこの step() は no-op だが、
-    # scheduler の step カウンタが進み "lr_scheduler.step() before
-    # optimizer.step()" の UserWarning を抑止できる。
+    # carrier optimizer の param_groups は空なのでこの step() は no-op だが、
+    # scheduler のカウンタが進み "lr_scheduler.step() before optimizer.step()" 警告を抑止できる。
     optimizer.step()
     return lr_scheduler
 

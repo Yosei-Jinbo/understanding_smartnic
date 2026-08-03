@@ -133,12 +133,7 @@ class ZeroWrapperExample(Module):
         self.gradient_average = True
         self.enable_backward_allreduce = True
         self.dist_backend = "nccl"
-        #self.timers = SynchronizedWallClockTimer()
-        
-        #self.engine_timers = EngineTimers(
-        #    enable_micro_timers=self.wall_clock_breakdown(),
-        #    enable_global_timers=self.wall_clock_breakdown())
-        
+
         self._is_gradient_accumulation_boundary = None
         
         # for debug purposes - can then debug print: debug_get_module_name(module)
@@ -171,10 +166,7 @@ class ZeroWrapperExample(Module):
         if model_parameters or optimizer:
             self._configure_optimizer(optimizer, model_parameters)
         #optimizerは必ず引数として与えるようにする!!!
-        #elif self.zero_optimization():
-        #    # no optim selected but zero is enabled
-        #    self.optimizer = self._configure_zero_optimizer(optimizer=None)
-        
+
         self._get_model_parameters()
         
     def memory_breakdown(self):
@@ -202,8 +194,7 @@ class ZeroWrapperExample(Module):
 
             logging.info(f"Set device to local rank {self.local_rank} within node.")
 
-            # ★ データ並列グループとサイズ（PyTorch 既定の WORLD を採用）
-            #    独自のサブグループを作らない限り、WORLD を “DP グループ” として扱って問題ありません。
+            # データ並列グループは PyTorch 既定の WORLD を採用
             self.data_parallel_group = dist.group.WORLD if dist.is_initialized() else None
             self.dp_world_size = self.world_size
 
@@ -244,14 +235,13 @@ class ZeroWrapperExample(Module):
         self._broadcast_model()
         
     def _get_model_parameters(self):
-        #auto tuining用の関数、DeepSpeed の autotuning は、与えたモデル／クラスタ条件で実行が安定して速くなる構成を自動探索するための仕組み
-        #今回の実装では利用しないのでそのままpassにしている
+        #DeepSpeed autotuning 用の関数。本実装では利用しないので pass
         pass
     
     #Optimizer に渡した param_groups の中に、同じ Parameter が重複登録されていないかを検査して止める関数
     def _check_for_duplicates(self, optimizer):
         for name, param in self.module.named_parameters():
-            param_id = id(param) #id(param) は Python 組み込み関数 id() で、そのオブジェクト（ここでは param）の 同一性（identity）を表す整数を返します
+            param_id = id(param)
             
             def ids_list(group):
                 return [id(param) for param in group]
@@ -264,7 +254,6 @@ class ZeroWrapperExample(Module):
             assert occurrence <= 1, f"Parameter with name: {name} occurs multiple times in optimizer.param_groups. Make sure it only appears once to prevent undefined behaviour."
     
     def _configure_zero_optimizer(self, optimizer):
-        #timers = self.timers if self.wall_clock_breakdown() else None
         timers = None
         self.contiguous_gradients = True
         self.reduce_bucket_size: int = self._reduce_bucket_size
@@ -307,11 +296,6 @@ class ZeroWrapperExample(Module):
         
         if self.zero_optimization():
             self.optimizer = self._configure_zero_optimizer(basic_optimizer)
-        
-        #圧縮・量子化について調べるのはいいかも SmartNICと組み合わせた帯域の改善があって見込みあり・興味があったら調べてね
-        #self.compression_scheduler = self._configure_compression_scheduler()
-        #self.quantizer = self._configure_quantization()
-        
 
     def train(self):
         self.module.train()
@@ -324,17 +308,13 @@ class ZeroWrapperExample(Module):
         for module in self.module.modules():
             module._parameters._in_forward = True
             pass
-        
-        #self._start_timers(self.engine_timers.forward_timers)
+
         loss = self.module(*inputs, **kwargs)
-        
+
         for module in self.module.modules():
             module._parameters._in_forward = False
 
-        #self._stop_timers(self.engine_timers.forward_timers)
-
-        # Profile-only: keep :ZeroWrapperExample.forward NVTX range open until
-        # all forward kernels finish (pair with backward's sync for symmetry).
+        # Profile-only (NSYS_SYNC_RANGES=1): forward NVTX range を全カーネル完了まで開けておく
         if os.environ.get("NSYS_SYNC_RANGES", "0") == "1":
             torch.cuda.synchronize()
 
@@ -376,33 +356,21 @@ class ZeroWrapperExample(Module):
                  release_loss=False,
                  retain_graph=False,
                  scale_wrt_gas=True):
-        #release_loss: lossの参照や関連バッファ情報をfreeする, allreduce_gradients: 終了後に勾配をallreduceする, retain_graph: 計算グラフを破棄する
-        #ZeRO Stage3ではbackwardでのallreduceは計算グラフ上で発火するようにしているので今はいらない
-        #scale_wrt_gas: lossをgradient_acculumation_stepで割る、lossを平均に戻す操作
-        
+        #ZeRO Stage3 では backward 中の reduce は計算グラフ上のフックで発火する
+
         # scale loss w.r.t. gradient accumulation if needed
         if self.gradient_accumulation_steps > 1 and scale_wrt_gas:
             loss = self._scale_loss_by_gas(loss.float())
-            
-        #self._start_timers(self.engine_timers.backward_timers)
-        
-        #self._start_timers(self.engine_timers.backward_inner_timers)
+
         self.optimizer.is_gradient_accumulation_boundary = self.is_gradient_accumulation_boundary()
         self.optimizer.backward(loss, retain_graph=retain_graph)
-        #self._stop_timers(self.engine_timers.backward_inner_timers)
 
-        #self._start_timers(self.engine_timers.backward_reduce_timers)
         if allreduce_gradients:
             # Traditional code path that allreduces the module parameter grads
             self.allreduce_gradients()
-        #self._stop_timers(self.engine_timers.backward_reduce_timers)
 
-        #self._stop_timers(self.engine_timers.backward_timers)
-
-        # Profile-only: force the :ZeroWrapperExample.backward NVTX range to stay open
-        # until all enqueued backward kernels are complete on the GPU. Without this,
-        # Phase14 makes Python return before GPU finishes, so nsys attributes the
-        # backward compute kernels to a different/ambiguous range.
+        # Profile-only (NSYS_SYNC_RANGES=1): backward NVTX range を GPU 完了まで開けておく
+        # (GPU flag wait 使用時は Python が GPU より先に return するため nsys の帰属が曖昧になる)
         if os.environ.get("NSYS_SYNC_RANGES", "0") == "1":
             torch.cuda.synchronize()
 
@@ -415,24 +383,10 @@ class ZeroWrapperExample(Module):
         self.global_steps += 1
     
     def step(self, lr_kwargs=None):
-        #self._start_timers(self.engine_timers.step_timers)
-        
         if self.is_gradient_accumulation_boundary():
             self.gas_boundary_ctr += 1
             self._take_model_step(lr_kwargs)
-        
-        #self._stop_timers(self.engine_timers.step_timers)
-        
-        #if self.wall_clock_breakdown():
-            # Log micro timing and reset
-            #self.timers.log(names=self.engine_timers.micro_timers,
-            #                memory_breakdown=self.memory_breakdown())
-            
-        #if self.wall_clock_breakdown():
-        #    # Log global timing and reset
-        #    if self.is_gradient_accumulation_boundary():
-        #        self.timers.log(self.engine_timers.global_timers)
-        
+
         self.micro_steps += 1
         
     def _take_model_step_dpu(self, lr_kwargs, block_eigenvalue={}):
@@ -442,25 +396,12 @@ class ZeroWrapperExample(Module):
         self.dpu_steps += 1
             
     def step_dpu(self, lr_kwargs=None):
-        #self._start_timers(self.engine_timers.step_timers)
         self.is_boundary = False
         if self.is_gradient_accumulation_boundary():
             self.gas_boundary_ctr += 1
             self.is_boundary = True
             self._take_model_step_dpu(lr_kwargs)
-        
-        #self._stop_timers(self.engine_timers.step_timers)
-        
-        #if self.wall_clock_breakdown():
-            # Log micro timing and reset
-        #    self.timers.log(names=self.engine_timers.micro_timers,
-        #                    memory_breakdown=self.memory_breakdown())
-            
-        #if self.wall_clock_breakdown():
-            # Log global timing and reset
-        #    if self.is_gradient_accumulation_boundary():
-        #        self.timers.log(self.engine_timers.global_timers)
-        
+
         self.micro_steps += 1
         return self.is_boundary
         
@@ -472,15 +413,7 @@ class ZeroWrapperExample(Module):
         self.optimizer.stop_adam_process()
 
     def _start_timers(self, timer_names):
-        #for name in timer_names:
-            #self.timers(name).start()
         pass
 
     def _stop_timers(self, timer_names):
-        #Flops profilerを入れた時に見ることにする, FLops profilerは外側でラップするかも(Stage3だとparameterをshardする関係で変になるらしいのでそこは考えておく)
-        #record = self.is_gradient_accumulation_boundary() and \
-        #    self.flops_profiler_enabled() and \
-        #        (self.global_steps >= self.flops_profiler_profile_step())
-        #for name in timer_names:
-        #    self.timers(name).stop(record=False)
         pass

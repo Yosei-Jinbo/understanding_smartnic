@@ -5,15 +5,7 @@ import sys
 class LoggerFactory:
     @staticmethod
     def create_logger(name=None, level=logging.INFO):
-        """create a logger
-
-        Args:
-            name (str): name of the logger
-            level: level of logger
-
-        Raises:
-            ValueError is name is None
-        """
+        """create a logger with the given name and level; raises ValueError if name is None"""
 
         if name is None:
             raise ValueError("name for logger cannot be None")

@@ -42,10 +42,7 @@ if not logger.handlers:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 
-# ---- ステップ内訳 NVTX (STEP_NVTX=1 で有効) ----
-# compute_idle_decomp の "Other"(=host_overhead) に丸め込まれている区間を細分するための計装。
-# 査読 C3「Fig.7 の Other を SM 競合緩和とホスト/起動オーバーヘッドに分離できるか」に対応。
-# xfer: 系 (XFER_NVTX) とは独立にゲートする。
+# ステップ内訳 NVTX (STEP_NVTX=1 で有効)。xfer: 系 (XFER_NVTX) とは独立にゲート。
 _STEP_NVTX = os.environ.get("STEP_NVTX", "0") == "1"
 
 
@@ -153,16 +150,11 @@ def _read_first_int(path: str, default: int = -1) -> int:
 
 
 def _cuda_pci_bus_id_hex(local_rank: int) -> str:
-    """
-    PyTorch の device properties から PCI bus id を得る。
-    返り値例: '0000:65:00.0'
-    """
+    """PyTorch の device properties から PCI bus id (例 '0000:65:00.0') を得る。"""
     try:
         prop = torch.cuda.get_device_properties(local_rank)
-        # PyTorch によっては pci_bus_id がある
         if hasattr(prop, "pci_bus_id"):
             return str(prop.pci_bus_id)
-        # ない場合は NVML 等が必要になるが、ここではフォールバック
     except Exception:
         pass
     return ""
@@ -283,20 +275,13 @@ def _nvml_try_get_bus_id(local_rank: int) -> str:
 
 
 def _sysfs_find_bdf_by_bus_only(bus_dec: int) -> str:
-    """
-    PyTorch が返す pci_bus_id が「バス番号(10進)のみ」だった場合の救済。
-    /sys/bus/pci/devices/* の BDF を走査して、bus が一致するものを探す。
-    例: bus_dec=101 -> bus_hex='65' -> '0000:65:00.0' 等を返す。
-
-    注意: 同一busに複数デバイスがある環境では曖昧になり得る。
-          その場合は NVML 経由を推奨。
-    """
+    """pci_bus_id がバス番号(10進)のみの場合の救済: sysfs を走査して BDF を推定
+    (同一 bus に複数デバイスがあると曖昧)。"""
     bus_hex = f"{bus_dec:02x}"
     cands = glob.glob(f"/sys/bus/pci/devices/*:{bus_hex}:*")
-    # cands の例: '/sys/bus/pci/devices/0000:65:00.0'
     if not cands:
         return ""
-    # numa_node が -1 でないものを優先（取れない環境もある）
+    # numa_node が取れるものを優先
     best = ""
     for p in sorted(cands):
         nn = _read_first_int(os.path.join(p, "numa_node"), default=-1)
@@ -309,12 +294,8 @@ def _sysfs_find_bdf_by_bus_only(bus_dec: int) -> str:
 
 
 def get_gpu_numa_node(local_rank: int) -> int:
-    """
-    GPU が属する NUMA node を推定。
-    優先順:
-      1) NVML で正しい BDF を取って sysfs を引く
-      2) PyTorch の pci_bus_id が整数(=bus番号)なら sysfs を走査して BDF を推定
-    """
+    """GPU の NUMA node を推定。NVML の BDF を優先し、無理なら PyTorch の
+    pci_bus_id (整数 bus 番号) から sysfs 走査で推定。"""
     # 1) NVML
     bdf = _nvml_try_get_bus_id(local_rank)
     if bdf:
@@ -322,12 +303,11 @@ def get_gpu_numa_node(local_rank: int) -> int:
         if os.path.exists(p):
             return _read_first_int(os.path.join(p, "numa_node"), default=-1)
 
-    # 2) PyTorch fallback（あなたのログのケース：23, 101）
+    # 2) PyTorch fallback
     try:
         prop = torch.cuda.get_device_properties(local_rank)
         if hasattr(prop, "pci_bus_id"):
             bus = prop.pci_bus_id
-            # bus が int の想定
             if isinstance(bus, int):
                 bdf2 = _sysfs_find_bdf_by_bus_only(bus)
                 if bdf2:
@@ -413,14 +393,6 @@ def run_zero(use_profiler=False, use_bf16=False, use_ema=False,
         # config
         # ------------------------
         num_workers = 0
-        #batch_size = 4
-        #num_workers = 0
-        #model_name = "tinynn"
-        #num_classes = 4
-        #input_size = 4
-        #num_train_samples = 16
-        #num_test_samples = 16
-        #epochs = 2
 
         # Causal LM モデル判定
         CAUSAL_LM_MODELS = {"opt-1.3b", "opt_1.3b", "llama-3b", "llama_3b", "llama-3.2-3b", "llama-7b", "llama_7b", "llama-2-7b"}
@@ -433,9 +405,8 @@ def run_zero(use_profiler=False, use_bf16=False, use_ema=False,
             _warmup = warmup_iters if warmup_iters is not None else 0
             total_target_iters = _warmup + measure_iters
             WARMUP_STEPS = _warmup
-            # nsys profile 区間 (default: measure iter 全部). hang 回避用に末尾を削れる。
-            # 例: NSYS_PROFILE_MEASURE_ITERS=25 measure_iters=30 → warmup 後 25 iter capture、
-            #     残り 5 iter は nsys 抜きで走る (hang してもレポートは保存済み)。
+            # NSYS_PROFILE_MEASURE_ITERS: nsys capture 区間 (default: measure iter 全部)。
+            # 末尾を nsys 抜きで走らせて hang 時もレポートを確保できる。
             _nsys_profile_measure = int(os.environ.get("NSYS_PROFILE_MEASURE_ITERS", str(measure_iters)))
             _nsys_profile_end_iter = _warmup + min(_nsys_profile_measure, measure_iters)
             epochs = num_epochs if num_epochs is not None else 10
@@ -496,9 +467,6 @@ def run_zero(use_profiler=False, use_bf16=False, use_ema=False,
             f"main_cores={main_cpu_set_reduced}"
         )
 
-        # DataLoader worker 数を main_cpu_set に合わせて制限
-        # (main_cpu_set が 3 コアなら、worker=2 程度が妥当)
-        #num_workers = max(0, min(num_workers, max(0, len(main_cpu_set) - 1)))
         print_rank_0(
             f"[BIND] rank={rank} local_rank(gpu)={local_rank} gpu_numa_node={gpu_node} "
             f"main_cpu_set={main_cpu_set} cpu_thread_set={cpu_thread_set} num_workers={num_workers}"
@@ -539,7 +507,6 @@ def run_zero(use_profiler=False, use_bf16=False, use_ema=False,
                 batch_size,
                 num_workers,
                 resize_to_imagenet=True, #ViT用
-                #resize_to_imagenet=False, #ResNet用
             )
 
         train_sampler = DistributedSampler(
@@ -570,28 +537,9 @@ def run_zero(use_profiler=False, use_bf16=False, use_ema=False,
         model.half()  # FP16に変換してからGPUに転送（大規模モデルのメモリ節約）
         model = model.to(device)
         model_parameters = model.parameters()
-        #通常だとmodelがbfloat16で登録されるとAdamもbf16で登録される。
-        #しかし、ZeROの実装ではoptimizerをfp32で登録しなおすのでこのままの実装でおけ
+        # ZeRO 実装側で optimizer を fp32 で登録し直すため、fp16 モデルのままで良い
         optimizer = DeepSpeedCPUAdam(model_parameters, lr=3e-4, eps=1e-5)
         loss_fn = nn.CrossEntropyLoss()
-        
-        # -------------------------
-        # デバッグ用にモデルを出力
-        # -------------------------
-        #def is_rank0() -> bool:
-        #    return (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0
-
-        #@torch.no_grad()
-        #def print_all_params_rank0(model: torch.nn.Module):
-        #    if not is_rank0():
-        #        return
-        #    for name, p in model.named_parameters():
-        #        t = p.detach()
-        #        print(f"=== {name} | shape={tuple(t.shape)} dtype={t.dtype} device={t.device} ===")
-        #        print(t)  # ← ここで全要素をそのまま出力
-        #        print()
-                
-        #print_all_params_rank0(model)
 
         # ユーザ実装の ZeRO ラッパ（Stage 3 を想定）
         zero_model = ZeroWrapperExample(
@@ -602,7 +550,7 @@ def run_zero(use_profiler=False, use_bf16=False, use_ema=False,
             max_live_parameters=max_live_parameters,
         )
 
-        # P2: ds_id → param_name マッピングを登録 (model 走査して name を埋める)
+        # ds_id → param_name マッピングを登録 (model 走査して name を埋める)
         try:
             import partition_parameters as _pp_p2
             _pp_p2.register_ag_param_names(model)
@@ -612,9 +560,8 @@ def run_zero(use_profiler=False, use_bf16=False, use_ema=False,
             if rank == 0:
                 print(f"[P2] register_ag_param_names failed: {_e}")
 
-        # Phase 14: GPU flag pool 初期化 (USE_GPU_FLAG_WAIT=1 で有効)
-        # AG completion を Python thread でなく GPU compute stream で同期する。
-        # cuStreamWaitValue32 が schedule され、Python の wait() は即 return。
+        # GPU flag pool 初期化 (USE_GPU_FLAG_WAIT=1): AG completion を
+        # cuStreamWaitValue32 で GPU compute stream 上で同期し、Python wait() は即 return。
         if os.environ.get("USE_GPU_FLAG_WAIT", "0") == "1":
             try:
                 import gpu_flag_pool as _gfp
@@ -784,7 +731,7 @@ def run_zero(use_profiler=False, use_bf16=False, use_ema=False,
         # ------------------------
         # Training loop
         # ------------------------
-        # Phase 20: AG/RS stall event-bracket tracker (env: MEASURE_AG_STALL=1)
+        # AG/RS stall event-bracket tracker (env: MEASURE_AG_STALL=1)
         try:
             from common import stall_event_tracker as _set
             _stall_tracker = _set.get_global() if _set.is_enabled() else None
@@ -821,18 +768,15 @@ def run_zero(use_profiler=False, use_bf16=False, use_ema=False,
 
                     step_t0 = time.perf_counter()
 
-                    # Phase 20: tracker に現 iter を伝える (AG/RS bracket の record に付与)
+                    # tracker に現 iter を伝える (AG/RS bracket の record に付与)
                     if _stall_tracker is not None:
                         _stall_tracker.set_iter(global_iter)
 
                     # nsys --capture-range=cudaProfilerApi 用: warmup 完了時にキャプチャ開始
                     if total_target_iters is not None and global_iter == WARMUP_STEPS:
                         torch.cuda.synchronize()
-                        # 全ランク profiling では、ランク間の到達スキュー (実測で最大 741ms) が
-                        # そのままキャプチャ窓のズレになり、「誰が誰を待っているか」を
-                        # タイムライン上で突き合わせられなくなる。窓の開始を揃える。
-                        # NCCL ではなく MPI barrier を使うのは、窓の端に NCCL カーネルを
-                        # 混入させないため。
+                        # キャプチャ窓の開始をランク間で揃える。窓の端に NCCL カーネルを
+                        # 混入させないため MPI barrier を使う。
                         comm.Barrier()
                         torch.cuda.profiler.start()
 
@@ -841,9 +785,7 @@ def run_zero(use_profiler=False, use_bf16=False, use_ema=False,
                     dbg.set_step(step + epoch * total_steps)
 
                     if epoch <= DPU_THRESHOLD:
-                        # ----------------------------------------------------------
-                        # ★重要：通常側でも zero_grad を明示（ラッパ依存を排除）
-                        # ----------------------------------------------------------
+                        # 通常側でも zero_grad を明示（ラッパ依存を排除）
                         optimizer.zero_grad(set_to_none=True)
 
                         _pp.set_ag_phase("forward")
@@ -932,8 +874,7 @@ def run_zero(use_profiler=False, use_bf16=False, use_ema=False,
 
                     # イテレーションベースの計測制御
                     global_iter += 1
-                    # nsys profile の終了: default では total target と同時だが、
-                    # NSYS_PROFILE_MEASURE_ITERS で早めに切って末尾の hang を回避できる
+                    # nsys profile 終了 (NSYS_PROFILE_MEASURE_ITERS で早めに切れる)
                     if total_target_iters is not None and global_iter == _nsys_profile_end_iter:
                         torch.cuda.synchronize()
                         comm.Barrier()  # キャプチャ窓の終端も揃える (start 側と対)
@@ -945,7 +886,7 @@ def run_zero(use_profiler=False, use_bf16=False, use_ema=False,
                     if profiler:
                         prof.step()
 
-                    if global_iter > 5:  # 旧 ThroughputMeter の warmup 判定 (5 step) と同等
+                    if global_iter > 5:
                         if since_last_timer % timer_every == 0:
                             timer_names = ["fwd", "bwd", "opt"] if epoch <= DPU_THRESHOLD else ["fwd", "bwd", "opt_dpu"]
                             timers.log(
@@ -1085,97 +1026,11 @@ def run_zero(use_profiler=False, use_bf16=False, use_ema=False,
                 pass
             print("Loss history:", loss_history)
             print("Accuracy history:", accuracy_history)
-            
-            '''
-            summary = summarize_by_submodule()
-
-            # 見やすさのため、fwd_exec の total が大きい順に並べる（無い場合は 0）
-            def _get_total(v, phase):
-                d = v.get(phase)
-                return float(d["total_ms"]) if d else 0.0
-
-            items = list(summary.items())
-            items.sort(key=lambda kv: _get_total(kv[1], "fwd_exec"), reverse=True)
-
-            def _fmt_phase(ph_name, d):
-                if d is None:
-                    return f"  {ph_name:<8}: (no data)"
-                return (
-                    f"  {ph_name:<8}: "
-                    f"seen={d['seen']:>4} wup={d['warmup_n']:>2} count={d['count']:>4} | "
-                    f"total={d['total_ms']:.3f}ms mean={d['avg_ms']:.3f}ms "
-                    f"std={d['std_ms']:.3f}ms cv={d['cv']:.3f} | "
-                    f"min={d['min_ms']:.3f}ms p50={d['p50_ms']:.3f}ms "
-                    f"p90={d['p90_ms']:.3f}ms p99={d['p99_ms']:.3f}ms max={d['max_ms']:.3f}ms"
-                )
-
-            for mkey, v in items:
-                print("module:", mkey)
-                print(_fmt_phase("fwd_fetch",      v.get("fwd_fetch")))
-                print(_fmt_phase("fwd_wait_stall", v.get("fwd_wait_stall")))
-                print(_fmt_phase("fwd_exec",       v.get("fwd_exec")))
-                print(_fmt_phase("bwd_fetch",      v.get("bwd_fetch")))
-                print(_fmt_phase("bwd_wait_stall", v.get("bwd_wait_stall")))
-                print(_fmt_phase("bwd_exec",       v.get("bwd_exec")))
-
-            # ---- pure_exec サマリ (子孫の wait_stall を差し引いた純粋カーネル時間) ----
-            # 葉モジュール: pure_exec == exec (純粋カーネル時間そのもの)
-            # 親モジュール: pure_exec == subtree 内の純粋カーネル時間総和
-            try:
-                smt.pretty_print_pure_exec(
-                    exec_phase="bwd_exec",
-                    stall_phase="bwd_wait_stall",
-                    sort_by="exec_total_s",
-                )
-                smt.pretty_print_pure_exec(
-                    exec_phase="fwd_exec",
-                    stall_phase="fwd_wait_stall",
-                    sort_by="exec_total_s",
-                )
-            except Exception as _e:
-                print(f"[warn] pretty_print_pure_exec failed: {_e}")
-
-            # ---- Phase 20: AG/RS stall event-bracket dump ----
-            if _stall_tracker is not None:
-                try:
-                    label = os.environ.get("AG_STALL_LABEL", "stall_events")
-                    out_path = os.environ.get(
-                        "AG_STALL_DUMP_PATH",
-                        f"logs/{label}_rank{rank}.json")
-                    extra = {
-                        "rank": rank,
-                        "world_size": world_size,
-                        "config": "sgc",
-                        "model": model_name,
-                        "warmup_iters": int(WARMUP_STEPS),
-                        "total_target_iters": int(total_target_iters) if total_target_iters else None,
-                        "use_gpu_flag_wait": os.environ.get("USE_GPU_FLAG_WAIT", "0"),
-                        "disable_completion_poller": os.environ.get(
-                            "DISABLE_COMPLETION_POLLER", "0"),
-                    }
-                    _stall_tracker.dump_json(out_path, extra=extra)
-                    print(f"[Phase 20] AG/RS stall events dumped to {out_path}")
-                    summ = _stall_tracker.summary()
-                    if summ:
-                        print("========== Phase 20: AG/RS stall summary (event-bracket) ==========")
-                        for k in sorted(summ.keys()):
-                            v = summ[k]
-                            print(f"  {k:<24} count={int(v['count']):>5} "
-                                  f"total={v['total_ms']:>9.1f}ms "
-                                  f"mean={v['mean_ms']:>7.3f}ms "
-                                  f"p50={v['p50_ms']:>7.3f}ms "
-                                  f"p95={v['p95_ms']:>7.3f}ms "
-                                  f"max={v['max_ms']:>7.3f}ms")
-                        print("=" * 70)
-                except Exception as _e:
-                    print(f"[warn] Phase 20 stall dump failed: {_e}")
-            '''
 
     finally:
         if profiler and hasattr(profiler, "stop"):
             profiler.stop()
-        # 初期化途中 (例: model.to(device) の CUDA OOM) で抜けると zero_model は未生成。
-        # ここで例外を投げると元の例外が握り潰され、真因が追えなくなる。
+        # 初期化途中で抜けた場合 zero_model は未生成。例外を投げると元の例外が潰れる。
         if zero_model is not None:
             try:
                 zero_model.stop_adam_process()

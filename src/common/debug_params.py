@@ -1,4 +1,3 @@
-# common/debug_params.py
 """ZeRO Stage 3 パラメータ検証用デバッグモジュール（--debug-params で有効化）。"""
 
 import os

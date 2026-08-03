@@ -1,31 +1,10 @@
-"""Phase 20 (Phase 1): per-AG/RS stall event-bracket tracker.
+"""Per-AG/RS stall tracker: compute stream 上の sync op (PF: cudaStreamWaitEvent /
+SO: cuStreamWaitValue32) を begin()/end() の CUDA event ペアで括り、両 mode 同一定義の
+GPU 側 stall 時間を測定する。
 
-両 mode 対称な「真の AG/RS stall」測定:
-  - PF (NCCL): handle.wait() = cudaStreamWaitEvent on NCCL completion event
-  - SO (DOCA): cuStreamWaitValue32 on DPU-written flag
-
-どちらも compute stream に積まれる sync op なので、その op を CUDA event ペアで
-括れば「op が compute stream の head に到達してから抜けるまでの GPU 上経過時間」
-= 真の stall 時間が両 mode 同じ定義で取れる。
-
-使い方:
-    from common import stall_event_tracker as _set
-    if _set.is_enabled():
-        h = _set.get_global().begin(stream, phase, op="ag",
-                                     ds_id=..., payload_bytes=...)
-        wait_op()                       # cudaStreamWaitEvent / cuStreamWaitValue32
-        _set.get_global().end(h)
-
-Env gates:
-    MEASURE_AG_STALL=1            # 計測有効化 (デフォルト無効)
-    AG_STALL_DUMP_PATH=<path>     # 出力 JSON path (省略時 stall_events.json)
-
-注意:
-  - PF mode では DISABLE_COMPLETION_POLLER=1 必須。
-    poller がいると handle.wait() が host 側 polling 経路となり
-    cudaStreamWaitEvent を発行しない (= ev_ms ≈ 0 で計測不能)。
-  - 計測 overhead: ev0/ev1.record() 各 ~1µs (host) + ~1µs (GPU stream op)。
-    75 AG/iter で ~0.3 ms/iter (基底 1100 ms の 0.03%)、無視可。
+Env gates: MEASURE_AG_STALL=1 (有効化), AG_STALL_DUMP_PATH (出力 JSON path)。
+PF mode では DISABLE_COMPLETION_POLLER=1 必須 (host polling 経路だと
+cudaStreamWaitEvent が発行されず ev_ms ≈ 0 になる)。
 """
 
 from __future__ import annotations

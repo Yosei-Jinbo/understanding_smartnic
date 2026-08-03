@@ -22,31 +22,14 @@ from torch.nn import Parameter
 import torch.distributed as dist
 from stage3_utils import * #parameterの持ち方が違うため独自のmemory_usage関数を呼ぶ
 
-# ---- 転送内訳計測用 NVTX (XFER_NVTX=1 で有効) ----
-# nsys の memcpy を NVTX 区間へ射影して「1step あたりの転送時間」を内訳付きで取るための計装。
-# scripts/extract_transfer_per_step.py が 'xfer:*' 区間を参照する。
-# per-submodule の USE_NVTX_RANGES とは独立にゲートする (単独で on にできるようにするため)。
-_XFER_NVTX = os.environ.get("XFER_NVTX", "0") == "1"
-
-
-def _xfer_push(label: str) -> None:
-    if _XFER_NVTX:
-        torch.cuda.nvtx.range_push(label)
-
-
-def _xfer_pop() -> None:
-    if _XFER_NVTX:
-        torch.cuda.nvtx.range_pop()
+# H2D/D2H の転送時間は CUDA Event ベースの計測 (_accumulate_* 系) で取得する。
 
 
 
 # ---- Completion poller gate (CUPTI/nsys との衝突回避用) ----
-# DISABLE_COMPLETION_POLLER=1 で _NcclCompletionPoller の使用を抑止する。
-# _NcclCompletionPoller は別スレッドから cudaEventQuery を高頻度に叩くため、
-# nsys の CUPTI hook と干渉して SIGSEGV を起こすことがある(2024.6.2 で確認)。
-# 無効化すると block_ms / dpu_ms の detailed 統計が取れなくなるが、
-# 学習の正しさと NVTX/CUDA Event 計測には影響しない。
-# 注: _DmaCompletionPoller は ctypes 直読みなので CUPTI と衝突せず、gate 対象外。
+# DISABLE_COMPLETION_POLLER=1 で _NcclCompletionPoller を抑止。poller は別スレッドから
+# cudaEventQuery を高頻度に叩き、nsys の CUPTI hook と干渉して SIGSEGV を起こすことがある。
+# 無効化すると block_ms / dpu_ms の detailed 統計は取れないが学習の正しさには影響しない。
 _DISABLE_COMPLETION_POLLER = os.environ.get("DISABLE_COMPLETION_POLLER", "0") == "1"
 
 class PartitionedParamStatus(Enum):
@@ -83,11 +66,7 @@ param_count = 0
 partitioned_param_data_shape = [0]
 zero_init_enabled = False
 
-# ------------------------------------------------------------
-# CPU<->GPU copy time accounting (CUDA event based)
-#   - We accumulate per-rank GPU time (ms) for:
-#       * param shard CPU->GPU (H2D) before all_gather
-# ------------------------------------------------------------
+# ---- all_gather 前の param shard H2D の GPU 時間集計 (CUDA event based, per-rank ms) ----
 PARAM_SHARD_H2D_TIME_MS: float = 0.0
 PARAM_SHARD_H2D_CALLS: int = 0
 
@@ -102,11 +81,7 @@ def get_param_shard_h2d_time_ms() -> float:
 def get_param_shard_h2d_calls() -> int:
     return int(PARAM_SHARD_H2D_CALLS)
 
-# ------------------------------------------------------------
-# Communication time accounting (CUDA event based)
-#   - We accumulate per-rank GPU time (ms) for:
-#       * parameter all_gather (weight materialization)
-# ------------------------------------------------------------
+# ---- parameter all_gather の通信時間集計 (CUDA event based, per-rank ms) ----
 ALL_GATHER_CALLS: int = 0
 ALL_GATHER_DPU_MS: float = 0.0        # 通信処理時間 (キュー待ち除去) の累計
 ALL_GATHER_BLOCK_MS: float = 0.0      # ブロック時間の累計
@@ -170,16 +145,10 @@ def reset_ag_phase_stats() -> None:
     _AG_FWD_BLOCK_MS = _AG_BWD_BLOCK_MS = 0.0
     _AG_FWD_CALLS = _AG_BWD_CALLS = 0
 
-# ---- Phase 20: per-AG/RS event-bracket stall tracker (両 mode 対称) ----
+# ---- per-AG/RS event-bracket stall tracker (両 mode 対称) ----
 def _stall_bracket(wait_callable, params_list=None, op: str = "ag", num_bytes: int = 0):
-    """Bracket the actual stream wait op with CUDA events.
-
-    PF (NCCL): handle.wait() は内部で cudaStreamWaitEvent を current stream に enqueue。
-    その前後を CUDA event で囲み、stream 上の真の stall ms を取得する (smartnic_offload 側と対称)。
-
-    DISABLE_COMPLETION_POLLER=1 必須 (poller 経路だと wait() が host polling になり
-    cudaStreamWaitEvent を発行しないため計測不能)。
-    """
+    """handle.wait() (cudaStreamWaitEvent enqueue) を CUDA event で囲み stream 上の真の stall ms を取得。
+    DISABLE_COMPLETION_POLLER=1 必須 (poller 経路は host polling になり計測不能)。"""
     try:
         from common import stall_event_tracker as _set  # type: ignore
     except Exception:
@@ -272,65 +241,13 @@ class _NcclCompletionPoller:
     def join(self):
         self._thread.join()
 
-FULL_PARAMETER_CALLS: int = 0
-FULL_PARAMETER_BYTES: int = 0
-FULL_PARAMETER_DMA_POLL_MS: float = 0.0
-FULL_PARAMETER_LOCK = threading.Lock()
-
-class _DmaCompletionPoller:
-    """pinned メモリポーリングで DMA 完了を検知"""
-    _POLL_INTERVAL = 0.00005
-
-    def __init__(self, device):
-        import ctypes
-        self._flag_cpu = torch.zeros(1, dtype=torch.int32, pin_memory=True)
-        self._flag_ptr = ctypes.cast(self._flag_cpu.data_ptr(), ctypes.POINTER(ctypes.c_int32))
-        self._device = device
-        self.t_complete = None
-        self._thread = None
-
-    def record(self):
-        gpu_flag = torch.ones(1, dtype=torch.int32, device=self._device)
-        self._flag_cpu.copy_(gpu_flag, non_blocking=True)
-        self._thread = threading.Thread(target=self._poll, daemon=True)
-        self._thread.start()
-
-    def _poll(self):
-        while self._flag_ptr[0] == 0:
-            time.sleep(self._POLL_INTERVAL)
-        self.t_complete = time.perf_counter()
-
-    def join(self):
-        if self._thread is not None:
-            self._thread.join()
-
-def _accumulate_full_parameter_detailed(dma_poll_ms: float, nbytes: int = 0) -> None:
-    global FULL_PARAMETER_CALLS, FULL_PARAMETER_BYTES, FULL_PARAMETER_DMA_POLL_MS
-    with FULL_PARAMETER_LOCK:
-        FULL_PARAMETER_CALLS += 1
-        FULL_PARAMETER_BYTES += nbytes
-        FULL_PARAMETER_DMA_POLL_MS += dma_poll_ms
-
-def get_full_parameter_copy_ms() -> float:
-    return float(FULL_PARAMETER_DMA_POLL_MS)
-
-def get_full_parameter_calls() -> int:
-    return int(FULL_PARAMETER_CALLS)
-
-def get_full_parameter_bytes() -> int:
-    return int(FULL_PARAMETER_BYTES)
-
 
 def allgather_fn(output_tensor: torch.Tensor,
                  input_tensor: torch.Tensor,
                  group=None,
                  async_op: bool=False):
-    """
-    output_tensor: 連結先（[world_size * local_numel] のフラット/同形テンソル）
-    input_tensor : 各 rank の入力（同形・同dtype・同device）
-    group        : プロセスグループ（None ならデフォルト）
-    async_op     : True なら Work ハンドルを返す（待機は handle.wait()）
-    """
+    """各 rank の input_tensor をフラットな output_tensor ([world_size * local_numel]) へ all-gather。
+    async_op=True なら Work ハンドルを返す。"""
 
     if group is None:
         group = dist.group.WORLD
@@ -477,12 +394,8 @@ temp_contiguous_tensor = None
 empty_buffers = {}
 
 
-'''
-with InsertPostInitMethodToModuleSubClasses(...): のブロックに入っている間だけ、
-すべての torch.nn.Module サブクラスの __init__ 振る舞いを差し替えて、
-**初期化直後に ZeRO-3 向けの後処理（post-init：分割/収集の管理など）**を自動で挟み込みます。
-メモリ効率の良いテンソル生成・Linear 演算への差し替えも同時に行います。
-'''
+#with ブロック中だけ全 nn.Module サブクラスの __init__ を差し替え、
+#初期化直後に ZeRO-3 向け post-init (分割/収集の管理) を自動で挟み込む
 class InsertPostInitMethodToModuleSubClasses(object):
     def __init__(self, enabled=True, dtype=None):
         self.enabled = enabled
@@ -504,16 +417,7 @@ class InsertPostInitMethodToModuleSubClasses(object):
                 
                 @functools.wraps(fn_to_apply)
                 def wrapped_fn_to_apply(module_to_apply_fn_to: Module) -> None:
-                    """gathers parameters before calling apply function. afterwards
-                    parameters are broadcasted to ensure consistency across all ranks
-                    then re-partitioned.
-
-                    takes the following steps:
-                    1. allgathers parameters for the current module being worked on
-                    2. calls the original function
-                    3. broadcasts root rank's parameters to the other ranks
-                    4. re-partitions the parameters
-                    """
+                    """apply 前に all-gather し、fn 適用後 rank0 から broadcast して再分割する。"""
                     if not all(is_zero_param(p) for p in module_to_apply_fn_to.parameters(recurse=False)):
                         raise RuntimeError(
                             f"not all parameters for {module_to_apply_fn_to.__class__.__name__}, "
@@ -552,13 +456,7 @@ class InsertPostInitMethodToModuleSubClasses(object):
             @functools.wraps(f)
             def wrapper(module, *args, **kwargs):
 
-                # important logic: We want to run post_init only after child's __init__ is
-                # completed, and do nothing after __init__ of any of its parents and grandparents in
-                # the inheritance ancestry. This way the partitioning will need to happen only once
-                # when the whole object is ready to be partitioned and not before. This is because
-                # often the child module will need to tweak the weights - for example running a
-                # custom weights init function. So if a parent created the weights param, the child
-                # won't need to gather it in order to tweak it
+                # post_init は子の __init__ 完了直後に 1 回だけ走らせる (親・祖先の __init__ 後には走らせない)
 
                 print_rank_0(f'Before initializing {module.__class__.__name__}',
                              force=False)
@@ -594,7 +492,6 @@ class InsertPostInitMethodToModuleSubClasses(object):
             
         # Replace .__init__() for all existing subclasses of torch.nn.Module recursively
         for subclass in get_all_subclasses(torch.nn.modules.module.Module):
-            # print(f"subclass={subclass.__module__}.{subclass.__qualname__}")
             _enable_class(subclass)
 
         # holding onto some methods so we can put them back the way they were in __exit__
@@ -659,12 +556,6 @@ def shutdown_init_context():
     torch.ones = _orig_torch_ones
     torch.full = _orig_torch_full
 
-    # un doing it here will undo it during training
-    # if self.mem_efficient_linear:
-    #    torch.nn.functional.linear = self.linear_bk
-    #        if self.mem_efficient_linear:
-    #            torch.nn.functional.linear = self.linear_bk
-
     zero_init_enabled = False
 
 '''どっかでwaitを呼ぼうね!! partitioned_param_coordinator.pyで呼ばれてます'''
@@ -698,7 +589,7 @@ class AllGatherHandle:
             _record_ag_detail(nbytes, max(0.0, comm_ms), block_ms, 0.0, prefetch_lead_ms, wall_ms)
             _accumulate_phase_block(block_ms)
 
-        # Phase 20: bracket the cudaStreamWaitEvent enqueue
+        # cudaStreamWaitEvent の enqueue を stall 計測で bracket
         _stall_bracket(instrument_w_nvtx(self.__handle.wait), [self.__param], op="ag")
         self.__param.ds_status = ZeroParamStatus.AVAILABLE
 
@@ -740,7 +631,7 @@ class AllGatherCoalescedHandle:
             _record_ag_detail(nbytes, max(0.0, comm_ms), block_ms, 0.0, prefetch_lead_ms, wall_ms)
             _accumulate_phase_block(block_ms)
 
-        # Phase 20: bracket the cudaStreamWaitEvent on NCCL completion event
+        # NCCL 完了イベントへの cudaStreamWaitEvent を stall 計測で bracket
         _stall_bracket(instrument_w_nvtx(self.__allgather_handle.wait),
                        list(self.__params), op="ag")
         self.__t_request = None
@@ -770,11 +661,7 @@ class AllGatherCoalescedHandle:
 
 class CPUAllGatherCoalescedHandle:
     """cpu_full_param からのローカルコピーだけで all-gather を完了させるハンドル。
-
-    - 通信は一切行わない
-    - .wait() が呼ばれたタイミングで CPU→GPU コピーを行い、
-      param.ds_status を AVAILABLE にする
-    """
+    通信は行わず、.wait() 時に CPU→GPU コピーして AVAILABLE にする。"""
 
     def __init__(self, params: List[Parameter], device: torch.device, t_request=None, start_event=None) -> None:
         self.__params = list(params)
@@ -793,9 +680,6 @@ class CPUAllGatherCoalescedHandle:
         if self.__complete:
             return
 
-        t_copy_start = time.perf_counter()
-        dma_poller = _DmaCompletionPoller(self.__device)
-
         with torch.no_grad():
             for p in self.__params:
                 cpu_full = getattr(p, "cpu_full_param", None)
@@ -810,11 +694,7 @@ class CPUAllGatherCoalescedHandle:
                     )
 
                 # CPU -> GPU に復元（local_device か param.device に合わせる）
-                _xfer_push("xfer:full_param_h2d")
-                try:
-                    full_gpu = cpu_full.to(self.__device, non_blocking=True)
-                finally:
-                    _xfer_pop()
+                full_gpu = cpu_full.to(self.__device, non_blocking=True)
                 full_gpu = full_gpu.view(p.ds_shape)
 
                 p.data = full_gpu
@@ -823,20 +703,11 @@ class CPUAllGatherCoalescedHandle:
                 from common import debug_params as dbg
                 dbg.log_ag_complete(p, tag="AG_COMPLETE(cpu_full)")
 
-        dma_poller.record()
-        dma_poller.join()
-        t_complete = dma_poller.t_complete or time.perf_counter()
-        dma_ms = (t_complete - t_copy_start) * 1000.0
-        nbytes = sum(p.ds_numel * p.element_size() for p in self.__params)
-        _accumulate_full_parameter_detailed(dma_ms, nbytes)
-
+        # H2D コピーは current stream 上で発行済み。後続の GPU op がストリーム順序で
+        # 自然に完了を待つため、明示的な完了待ちは不要。
         self.__complete = True
 
-'''
-これは DeepSpeed ZeRO-3 の 初期化コンテキスト (zero.Init) を実装したクラスです。
-目的は「巨大モデルを効率的に初期化して、その場でパラメータを分割 (shard) する」ことです。
-'''
-# Replaces all parameters in module with Scattered Parameters
+#DeepSpeed ZeRO-3 の初期化コンテキスト (zero.Init): モデルを初期化しつつその場でパラメータを分割する
 class Init(InsertPostInitMethodToModuleSubClasses):
     param_id = 0
     
@@ -881,9 +752,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             self._convert_to_deepspeed_param(param) #paramにフィールド・動的なメソッドをはやす
             param.partition()
     
-    #各“子モジュール直下（recurse=False）のパラメータを ZeRO-3 用の分割管理（Scattered/ZeroParam）に変換し、
-    # rank0 の値でそろえてからシャーディングする処理です。
-    # 実行は post_init タイミング（＝その子モジュールの __init__ が完全に終わった直後）で1回だけ走ります。
+    #子モジュール直下のパラメータを ZeRO 分割管理に変換し、rank0 の値で揃えてシャーディング (post_init で 1 回だけ実行)
     def _post_init_method(self, module):
         print_rank_0(f'Converting Params in {module.__class__.__name__}', force=False)
         see_memory_usage(
@@ -914,21 +783,8 @@ class Init(InsertPostInitMethodToModuleSubClasses):
     def _convert_to_deepspeed_param(self, param):
         #このパラメータは ZeRO により分割（シャード）管理されることを示す種別タグ。将来 Normal/Remote 等と分岐させるための識別。
         param.ds_param_type = ZeroParamType.PARTITIONED
-        '''
-        ZeroParamStatus: 現在の可用状態。
-        AVAILABLE: その rank に **完全復元（all-gather 済み）**で手元にある状態
-        NOT_AVAILABLE: まだ完全には手元にない（分割の一部しかない/オフロード中など）
-        INFLIGHT: 通信などで「復元中」
-        '''
-        '''
-        GPU メモリに shard がないけど CPU にある、というケースについて
-        param.ds_status（全体状態）は NOT_AVAILABLE
-        → なぜなら「フルサイズのパラメータ」は CPU にも存在しない。持っているのは rank shard だけ。
-
-        param.ds_tensor.status（shard 状態）は AVAILABLE
-        → shard 自体は CPU メモリ上にあってアクセス可能。GPU 上にはないけど「NOT_AVAILABLE」ではない
-        '''
-         #パラメータ全体の可用状態。典型遷移は NOT_AVAILABLE（未復元/解放中）→ INFLIGHT（通信中）→ AVAILABLE（フル値が手元）。
+        #ds_status はフル値の可用状態 (NOT_AVAILABLE→INFLIGHT→AVAILABLE)。shard しか持たない場合は
+        #フル値が無いので NOT_AVAILABLE (shard 側の状態は ds_tensor.status が別に持つ)
         param.ds_status = ZeroParamStatus.AVAILABLE
 
         #元の完全テンソル形状（分割/パディング前の論理形状）。
@@ -960,11 +816,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         param.cpu_full_param = None #CPUに全てのパラメータを保持する
         param.cpu_full_param_pool = None #CPUのフルパラメータをプールしておく・ピン止め森のコストは高いのでこのfull_param_poolを利用してピン止めコストを減らす
         
-        '''
-        all_gather前後での引数paramについて
-        all_gather 前: param.data → freeされているのでアクセス不可(param.ds_tensorに自分の担当分のみ保存されている)
-        all_gather 後: param.data → 全 rank の shard を集めた「フルサイズ」テンソル。
-        '''
+        #all_gather 前: param.data は free 済み (担当分は ds_tensor)。all_gather 後: param.data がフルサイズ
         def all_gather(param_list=None, async_op=False, hierarchy=0):
             cls = param
             if param_list is None:
@@ -982,18 +834,13 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             params = sorted(params, key=lambda p: p.ds_id) #全 rank で同じ順序に並べ替え。coalesced ではフラットに連結して1回の通信をするため、順序が違うと取り違え事故になる。
             debug_rank0(f"-allgather_coalesced: {[p.ds_id for p in params]}")
 
-            # ===== ここから CPU フルパラメータ優先パス =====
-            # 環境変数 ENABLE_FULL_PARAM_TRANSFER=1 の場合のみ有効（デフォルト: 無効）
-            # 全ての param が cpu_full_param を持っているなら、通信せずに CPU→GPU コピーだけを行う
+            # ENABLE_FULL_PARAM_TRANSFER=1 (デフォルト無効) かつ全 param が cpu_full_param を
+            # 持つ場合は通信せず CPU→GPU コピーだけで済ませる
             if os.environ.get("ENABLE_FULL_PARAM_TRANSFER", "0") == "1" and \
                all(getattr(p, "cpu_full_param", None) is not None for p in params):
-                #print_rank_0(f"-allgather_coalesced (CPU full param path): {[p.ds_id for p in params]}", force=True)
-                # Init.__init__ で定義した local_device を使って GPU に復元する
                 t_request = time.perf_counter()
                 return CPUAllGatherCoalescedHandle(params, self.local_device, t_request=t_request)
-            
-            #print_rank_0(f"-allgather_coaleseced: no cpu_data {[p.ds_id for p in params]}", force=True)
-            
+
             if len(params) == 1:
                 param, = params
                 param_buffer = torch.empty(
@@ -1010,12 +857,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                 _st = torch.cuda.Event(enable_timing=True)
                 _ed = torch.cuda.Event(enable_timing=True)
                 _st.record()
-                # H2D の内訳は NVTX 区間 'xfer:param_shard_h2d' の memcpy 射影 (nsys) で取得する。
-                _xfer_push("xfer:param_shard_h2d")
-                try:
-                    shard_cuda = param.ds_tensor.to(_local_dev, non_blocking=True)
-                finally:
-                    _xfer_pop()
+                shard_cuda = param.ds_tensor.to(_local_dev, non_blocking=True)
                 _ed.record()
 
                 # elapsed_time を取るには完了待ちが必要（ここで 1 回だけ同期）
@@ -1032,14 +874,6 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                 param.data = param_buffer.narrow(0, 0, param.ds_numel).view(param.ds_shape).to(param.device)
 
                 return AllGatherHandle(handle, param, t_request=t_request)  # このhandleが実行されるとparamにフルサイズの重みパラメータが入る
-                '''
-                start_event = torch.cuda.Event(enable_timing=True)
-                start_event.record()
-                handle = _dist_allgather_fn(param.ds_tensor.to(torch.cuda.current_device()), param_buffer, self.ds_process_group)
-                #先頭から実長分だけ切り出し、元形状に view、元デバイスへ to。.data で param のストレージを差し替え(param_bufferに対する操作がparam.dataに対する操作になる)
-                param.data = param_buffer.narrow(0, 0, param.ds_numel).view(param.ds_shape).to(param.device)
-                return AllGatherHandle(handle, param, start_event=start_event) #このhandleが実行されるとparamにフルサイズの重みパラメータが入る
-                '''
             else:
                 #params に入っているのは「自分の rank が担当しているシャード（＝ds_tensor）を持っているパラメータだけ」
                 partition_sz = sum(p.ds_tensor.ds_numel for p in params) #このランクが持つ全パラのシャード長の合計（連結後の 1ランク当たり長）
@@ -1061,15 +895,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                     _st = torch.cuda.Event(enable_timing=True)
                     _ed = torch.cuda.Event(enable_timing=True)
                     _st.record()
-                    # H2D の内訳は NVTX 区間 'xfer:param_shard_h2d' の memcpy 射影 (nsys) で取得する。
-                    _xfer_push("xfer:param_shard_h2d")
-                    try:
-                        # 注: ds_tensor が既に GPU 常駐 (--no-offload) の場合 .to() は no-op。
-                        # 以前ここに .to("cpu") のデッドストアがあり、ZeRO-3 で全シャードを
-                        # 毎 AG ごとに GPU→CPU へ無駄コピーしていた (2026-07-29 削除)。
-                        _tmp = _p.ds_tensor.to(_local_dev, non_blocking=True)
-                    finally:
-                        _xfer_pop()
+                    _tmp = _p.ds_tensor.to(_local_dev, non_blocking=True)
                     _ed.record()
                     _ev_pairs.append((_st, _ed))
                     _shards.append(_tmp)
@@ -1081,8 +907,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                         _accumulate_param_shard_h2d_time_ms(_st.elapsed_time(_ed))
 
                 instrument_w_nvtx(torch.cat)(_shards, out=partitions[self.rank])
-                #instrument_w_nvtx(torch.cat)([p.ds_tensor.to(torch.cuda.current_device()) for p in params], out=partitions[self.rank])
-                
+
                 t_request = time.perf_counter()
                 handle = _dist_allgather_fn(partitions[self.rank], flat_tensor, self.ds_process_group)
 
@@ -1225,12 +1050,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         global reuse_buffers
         if param.ds_status is ZeroParamStatus.AVAILABLE: #フルサイズがすでにあるなら分割
             print_rank_0(f"Partitioning param id {param.ds_id} reuse buffers {reuse_buffers}", force=False)
-            '''
-            すでに以前作った分割片（ds_tensor）が残っていて、かつ パラメータ値が直近で更新されていないなら、
-            フルの param.data を解放（free_param）。
-            ds_tensor はそのまま使えるので、ここで終了。
-            つまり「シャードはもうある・中身も最新 → フル側だけ捨てればOK」という最短経路
-            '''
+            #ds_tensor が既にあり値も未更新なら、フル側 (param.data) を解放するだけでよい
             if param.ds_tensor is not None and not has_been_updated:
                 see_memory_usage(f'Before partitioning param {param.ds_id} {param.shape}', force=False)
                 free_param(param) #フルサイズのparamを開放して終わり
@@ -1287,11 +1107,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         see_memory_usage(f'After allocate allgather param {debug_param2name_id_shape_status(param)} {aligned_param_size} {partition_size} ', force=False)
         torch.cuda.synchronize() #単一プロセスでの同期, GPU kernelが終わるまではCPU実行を止める (torch.distributed.barrier()は複数プロセスのバリア同期)
         print_rank_0(f"{'--'* hierarchy}----allgather param with {debug_param2name_id_shape_status(param)} partition size={partition_size}")
-        '''
-        _all_gather_base は PyTorch 1.8 以降で入った新しい実装で、従来の dist.all_gather と違い:
-        出力を「リスト」ではなく 1つのフラットテンソルに直接書き込める。
-        メモリアロケーションや Python ループを省けるので高速＆低オーバーヘッド
-        '''
+        #_all_gather_base は出力をリストでなく 1 本のフラットテンソルに直接書くため高速・低オーバーヘッド
         handle = dist.all_gather_base(flat_tensor, param.ds_tensor.cuda(), group=self.ds_process_group, async_op=async_op)
         
         replicated_tensor = flat_tensor.narrow(0, 0, param.ds_numel).view(param.ds_shape) #フルサイズのパラメータをreplicated_tensorに入れる
@@ -1381,11 +1197,8 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             partition_size = param.ds_tensor.ds_numel
             start = self.rank * partition_size
             end = start + partition_size
-            #末尾以外の rank では、_reduce_scatter_gradient 内で 入力スライスを param.grad の該当ビューとして渡しているため、
-            #**reduce_scatter の出力もそのビュー（= param.grad の一部）に“直書き”**される → コピー不要。
-            #末尾 rank だけは パディング分の都合で “一時バッファ”を入力に使うため、出力もそこに書き込まれる → 後で有効要素だけ param.grad へ書き戻す。
-            #start < param.ds_numel(全体サイズ) < end となっていると末尾が足りていない(paddingしたため)
-            #reduced_partitionには[自分rankの集約済みgradient]のみが入っているので0スタートelements個だけcopyすればいい
+            #末尾以外の rank は出力が param.grad のビューに直書きされるためコピー不要。
+            #末尾 rank (start < ds_numel < end) はパディング用一時バッファに出力されるため有効要素だけ書き戻す
             if start < param.ds_numel and end > param.ds_numel:
                 elements = param.ds_numel - start
                 param.grad.view(-1).narrow(0, start, elements).copy_(reduced_partition.narrow(0,0,elements)) #reduce済み勾配をparamにコピーする(自分の担当分のみ)
@@ -1431,9 +1244,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         end = start + partition_size ##担当する勾配のstart, end
         dest_tensor_full_buffer = partition_buffer.view(-1).narrow(0, 0, partition_size) #出力先を 1D 化し、先頭 partition_size 分を「このランクの受け取り領域」としてビュー化
 
-        #このランクの開始位置が実データ範囲内なら、実データが存在する要素数 elements を決定
-        # （末尾パディングがあると elements < partition_size）。
-        #src_tensor＝フル勾配の該当スライス、dest_tensor＝出力先の該当スライス。
+        #実データが存在する要素数 elements を決定 (末尾パディングがあると elements < partition_size)
         if start < param.ds_numel:
             elements = min(param.ds_numel - start, partition_size)
             dest_tensor = dest_tensor_full_buffer.narrow(0, 0, elements)

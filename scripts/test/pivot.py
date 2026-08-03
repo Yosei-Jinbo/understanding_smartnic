@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """results.csv を「RS/AG × N を行、各設定を列」にピボットする。
 
-sweep_multicore.sh / sweep_ablation.sh が出す long 形式 CSV を読み、
+sweep_ablation.sh が出す long 形式 CSV を読み、
 各 (collective, size) を 1 行、各設定を 1 列にした見やすい表を作る。
 
 使い方:

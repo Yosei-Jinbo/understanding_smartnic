@@ -655,34 +655,21 @@ static void *message_worker_thread(void *arg)
     struct comch_ctrl_path_server_objects *sample_objects = w->sample_objects;
     struct control_cmd *recv_cmd = w->recv_cmd;
 
-    /* 重要: control_cmd_unpack は packed_cmd (= buf_copy) を return するため
-     * recv_cmd == w->buf_copy。1 回の free で両方解放される。
-     * ここでは free(recv_cmd) が buf_copy も解放することに注意。 */
-
     if (recv_cmd) {
         switch (recv_cmd->type) {
         case CONTROL_CMD_UCP_CREATE_RING:
             execute_doca_create_ring_cmd(recv_cmd, sample_objects);
-            /* Parallel ring dispatch (env var PHASE15_ENABLE_RING_QUEUES=1):
-             *   Ring 0 / Ring 1 の 2 worker thread を起動し、AG を round-robin で並列実行する。
-             *
-             *   busy-poll 版は unpinned thread × 4 が critical pinned thread を阻害して
-             *   全体悪化 → 失敗。現行は adaptive hybrid: Tier 1 (fast path) +
-             *   Tier 2 (short spin 50us) + Tier 3 (cond_wait)。idle 時は CPU 消費ゼロで
-             *   pinned thread と競合しない。
-             *
-             *   デフォルトは無効 (安全側)。PHASE15_ENABLE_RING_QUEUES=1 で opt-in 有効化。 */
             {
                 static int use_ring_queues = -1;
                 if (use_ring_queues < 0) {
-                    const char *e = getenv("PHASE15_ENABLE_RING_QUEUES");
+                    const char *e = getenv("ENABLE_RING_QUEUES");
                     use_ring_queues = (e && atoi(e) != 0) ? 1 : 0;
                 }
                 if (use_ring_queues) {
                     (void)ring_proc_threads_start(sample_objects);
                 } else {
                     if (sample_objects->rank == 0) {
-                        printf("[DPU] ring_proc threads NOT started (PHASE15_ENABLE_RING_QUEUES unset), using inline path\n");
+                        printf("[DPU] ring_proc threads NOT started (ENABLE_RING_QUEUES unset), using inline path\n");
                         fflush(stdout);
                     }
                 }
@@ -691,20 +678,13 @@ static void *message_worker_thread(void *arg)
             free(w);
             return NULL;
         case CONTROL_CMD_UCP_COLLECTIVE:
-            /* Dispatch (env PHASE15_ENABLE_RING_QUEUES=1):
-             *   - AG: ag_seq % N_RINGS で Ring 0/1 に round-robin 配分 → 2-way 並列
-             *   - RS: 常に Ring 0 (既存 semantics 維持)
-             *   - デフォルト (env unset): inline 実行パス (serial)
-             *
-             *   per-op 計測で DPU inflight=1 が判明 (msg_pool = 1 thread の結果)。
-             *   adaptive hybrid wait により parallel dispatch を安全に enable できる。 */
             {
                 static int use_ring_queues = -1;
                 if (use_ring_queues < 0) {
-                    const char *e = getenv("PHASE15_ENABLE_RING_QUEUES");
+                    const char *e = getenv("ENABLE_RING_QUEUES");
                     use_ring_queues = (e && atoi(e) != 0) ? 1 : 0;
                     if (sample_objects->rank == 0) {
-                        printf("[DPU] PHASE15_ENABLE_RING_QUEUES=%d — %s\n",
+                        printf("[DPU] ENABLE_RING_QUEUES=%d — %s\n",
                                use_ring_queues,
                                use_ring_queues ? "parallel ring queue (2 workers)" : "inline serial (default)");
                         fflush(stdout);

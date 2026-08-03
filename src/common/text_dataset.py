@@ -1,4 +1,3 @@
-# common/text_dataset.py
 import os
 import hashlib
 from pathlib import Path
@@ -7,9 +6,6 @@ import torch
 from datasets import load_dataset
 from transformers import AutoTokenizer
 
-# wikitext-103 の tokenization は 117M トークン × per-text Python loop で
-# 初回 2〜4 分かかる。(tokenizer, dataset, split) 単位で結果テンソルを
-# ローカルに pickle キャッシュすることで 2 回目以降は秒で済むようにする。
 # キャッシュパスは TOKENIZED_CACHE_DIR で上書き可(デフォルト ~/.cache/hf_tokenized)。
 _TOKENIZED_CACHE_DIR = Path(
     os.environ.get("TOKENIZED_CACHE_DIR", Path.home() / ".cache" / "hf_tokenized")
@@ -31,22 +27,17 @@ def _tokenize_and_concat_cached(
     dataset_id: str,
     split_name: str,
 ) -> torch.Tensor:
-    """
-    split のテキストを全て tokenize → 連結した LongTensor を返す。
+    """split のテキストを全て tokenize → 連結した LongTensor を返す。
     結果は (tokenizer, dataset, split) 単位でキャッシュする。
-
-    batched tokenizer API を使って初回 tokenization も数倍高速化する。
     """
     cache_path = _tokenized_cache_path(tokenizer_name, dataset_id, split_name)
 
     if cache_path.exists():
-        # キャッシュヒット: 直接 tensor をロード
         print(f"[CausalLM cache] hit:  {cache_path}")
         return torch.load(cache_path, map_location="cpu")
 
     print(f"[CausalLM cache] miss: {cache_path} (初回のみ tokenize 実行)")
 
-    # 空行を除いたテキストを集める
     texts = [t for t in split_obj["text"] if t.strip()]
 
     # 大きなバッチサイズで一気に tokenize(fast tokenizer の multi-threaded 経路に乗る)
@@ -60,7 +51,6 @@ def _tokenize_and_concat_cached(
 
     t = torch.tensor(all_ids, dtype=torch.long)
 
-    # キャッシュに保存
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
     torch.save(t, tmp_path)
@@ -128,7 +118,6 @@ class CausalLMDataset(torch.utils.data.Dataset):
         }
 
 
-# モデル名 → トークナイザ名のマッピング
 _CAUSAL_LM_TOKENIZERS = {
     "opt-1.3b": "facebook/opt-1.3b",
     "opt_1.3b": "facebook/opt-1.3b",
@@ -160,7 +149,6 @@ def get_causal_lm_datasets(
         tokenizer.pad_token = tokenizer.eos_token
 
     # cache hit 時は load_dataset を呼ばずに済ませたい(HF HTTP 待ちも避ける)。
-    # 両 split が既にキャッシュ済みなら load_dataset をスキップする。
     train_cache = _tokenized_cache_path(tokenizer_name, dataset_id, "train")
     test_cache = _tokenized_cache_path(tokenizer_name, dataset_id, "test")
 
@@ -238,7 +226,6 @@ def get_mlm_datasets(
     tokenizer_name = _MLM_TOKENIZERS.get(model_name.lower(), model_name)
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
 
-    # cache hit 時は load_dataset をスキップ
     train_cache = _tokenized_cache_path(tokenizer_name, dataset_id, "train")
     test_cache = _tokenized_cache_path(tokenizer_name, dataset_id, "test")
 

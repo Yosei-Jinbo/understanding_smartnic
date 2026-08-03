@@ -13,10 +13,8 @@ import logging
 def print_rank_0(message):
     if torch.distributed.is_initialized():
         if torch.distributed.get_rank() == 0:
-            #logger.info(message)
             pass
     else:
-        #logger.info(message)
         pass
 
 
@@ -244,16 +242,13 @@ def start_profiler(
     sch = prof_schedule(wait=wait, warmup=warmup, active=active, repeat=repeat)
 
     def _on_trace_ready_tb(p):
-        # TensorBoard向け（サイズは大きめ）
         return tensorboard_trace_handler(log_dir)(p)
 
     def _on_trace_ready_chrome(p):
-        # 軽量な1ファイル出力（Chrome trace）
         ts = int(time.time())
         path = os.path.join(log_dir, f"trace_{ts}.json")
         p.export_chrome_trace(path)
 
-        # 古いファイルを削除して増えすぎを防止
         traces = sorted(glob.glob(os.path.join(log_dir, "trace_*.json")))
         if keep_last_n_traces is not None and len(traces) > keep_last_n_traces:
             for old in traces[:-keep_last_n_traces]:

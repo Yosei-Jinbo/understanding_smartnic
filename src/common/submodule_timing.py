@@ -15,14 +15,8 @@ except Exception:
 
 @dataclass
 class Stat:
-    """
-    集計統計（比較用途向けに拡張）
-      - count / total / mean
-      - std / min / max
-      - p50/p90/p99（固定長サンプルから近似）
-      - warmup: 最初の warmup_n サンプルを統計から除外
-    """
-    # warmup: 「最初のN回は統計に入れない」
+    """集計統計: count/total/mean/std/min/max + 固定長サンプルによる p50/p90/p99 近似。
+    最初の warmup_n サンプルは統計から除外する。"""
     warmup_n: int = 10
     seen: int = 0  # 受け取ったサンプル数（warmup含む）
 
@@ -47,7 +41,6 @@ class Stat:
 
         self.seen += 1
         if self.seen <= self.warmup_n:
-            # warmup: 統計に入れない
             return
 
         self.count += 1
@@ -95,8 +88,7 @@ class Stat:
         return xs[k]
 
 
-# 集計は (phase, module_id) 単位
-# phase: "fwd_fetch", "fwd_exec", "bwd_fetch", "bwd_exec" など（任意に追加可）
+# 集計は (phase, module_id) 単位。phase: "fwd_fetch", "bwd_exec" など任意に追加可
 STATS: Dict[Tuple[str, int], Stat] = {}
 
 # wallclock 計測中: (phase, module_id, call_id) -> t_start
@@ -105,8 +97,7 @@ _INFLIGHT_CPU: Dict[Tuple[str, int, int], float] = {}
 # gpu event 計測中: (phase, module_id, call_id) -> start_event
 _INFLIGHT_GPU: Dict[Tuple[str, int, int], Any] = {}
 
-# end 時点では同期しない。ここに pending を積んで、snapshot/pretty_print 時に flush する。
-# 要素: (phase, module_id, start_event, end_event)
+# end 時点では同期せず pending に積み、snapshot/pretty_print 時に flush。要素: (phase, mid, start_ev, end_ev)
 _PENDING_GPU: List[Tuple[str, int, Any, Any]] = []
 
 # module.id -> module info
@@ -140,9 +131,7 @@ def get_module_info(mid: int) -> Optional[Dict[str, Optional[str]]]:
 
 
 def _is_exec_phase(phase: str) -> bool:
-    # "_exec" と "_stall" を CUDA Event 計測経路に載せる。
-    # _stall は fetch_sub_module 呼び出しの compute stream 上の stall 時間を測るために
-    # 追加された phase で、wallclock ではなく GPU 側の elapsed_time で測る必要がある。
+    # "_exec"/"_stall" は wallclock でなく CUDA Event (GPU 側 elapsed_time) で測る必要がある
     return phase.endswith("_exec") or phase.endswith("_stall")
 
 
@@ -268,31 +257,10 @@ def compute_pure_exec_by_hierarchy(
     exec_phase: str = "bwd_exec",
     stall_phase: str = "bwd_wait_stall",
 ) -> Dict[int, Dict[str, Any]]:
-    """
-    module 階層(`_timing_name` の dotted path)を使って pure_exec を算出する。
-
-    pure_exec(M) = exec(M) - Σ_{D ∈ descendants(M)} wait_stall(D)
-
-    wait_stall は「その module 用の fetch_sub_module で発生した GPU compute stream の stall」
-    なので、親モジュールの exec ウィンドウには子孫の wait_stall が全て混入している。
-    これを差し引くことで、その subtree の純粋カーネル時間が得られる。
-
-    葉モジュール(子孫なし)の場合: pure_exec(L) = exec(L) = 純粋カーネル時間。
-    親モジュール(container)の場合: pure_exec(M) = subtree 全体の純粋カーネル時間。
-
-    Returns:
-      {module_id: {
-         "name": str,
-         "class": str,
-         "exec_total_s": float,           # 生の exec 合計時間(stalls混入)
-         "exec_mean_s": float,
-         "exec_count": int,
-         "stall_self_s": float,           # 自分自身の wait_stall 合計
-         "stall_in_subtree_s": float,     # 子孫全員の wait_stall 合計
-         "pure_exec_total_s": float,      # 子孫 stall を差し引いた subtree 総カーネル時間
-         "pure_exec_mean_s": float,       # 同 mean
-      }}
-    """
+    """`_timing_name` の階層から pure_exec(M) = exec(M) - Σ 子孫の wait_stall を算出。
+    親の exec ウィンドウには子孫の fetch stall が混入するため差し引き、subtree の純粋カーネル時間を得る。
+    Returns: {module_id: {name, class, exec_total_s/mean_s/count, stall_self_s,
+    stall_in_subtree_s, pure_exec_total_s/mean_s}}"""
     with _LOCK:
         _flush_pending_gpu_locked()
 
@@ -320,8 +288,7 @@ def compute_pure_exec_by_hierarchy(
         exec_mean_s = (exec_total_s / exec_count) if exec_count else 0.0
         stall_self_s = stall_self_st.total_s if stall_self_st is not None else 0.0
 
-        # descendants: _timing_name が f"{name}." で始まる他モジュール
-        # name=="" (root) の場合は自分以外全て
+        # descendants: _timing_name が f"{name}." で始まる他モジュール (name=="" root は自分以外全て)
         stall_in_subtree_s = 0.0
         if name:
             prefix = name + "."
@@ -393,19 +360,8 @@ def pretty_print_pure_exec(
 
 
 def pretty_print(limit: int = 200, sort_by: str = "total_s") -> None:
-    """
-    module.id 単位の集計を表示（モジュール名/型も併記）
-
-    sort_by:
-      - total_s (default)
-      - count
-      - avg_s
-      - std_s
-      - p90
-      - p99
-      - cv
-      - seen  (warmup含む観測回数)
-    """
+    """module.id 単位の集計を表示（モジュール名/型も併記）。
+    sort_by: total_s (default) / count / avg_s / std_s / p90 / p99 / cv / seen (warmup 含む)"""
     with _LOCK:
         _flush_pending_gpu_locked()
 

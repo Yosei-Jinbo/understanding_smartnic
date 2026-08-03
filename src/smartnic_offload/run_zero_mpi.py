@@ -1,13 +1,6 @@
-# run_zero_mpi.py
-"""
-mpirun 用ランチャ
-
-- mpirun + mpi4py で rank / world_size を取得
-- それを torch.distributed が期待する環境変数
-  (RANK, WORLD_SIZE, LOCAL_RANK, MASTER_ADDR, MASTER_PORT)
-  に詰めてから、元の run_zero.run_zero() を呼び出す。
-
-元の run_zero.py は torchrun 前提のままで OK。
+"""mpirun 用ランチャ。mpi4py で rank/world_size を取得し、torch.distributed が
+期待する環境変数 (RANK, WORLD_SIZE, LOCAL_RANK, MASTER_ADDR, MASTER_PORT) を
+セットしてから run_zero.run_zero() を呼ぶ。
 """
 
 import os
@@ -25,8 +18,8 @@ sys.path.insert(0, str(COMCH_HOST_DIR))
 import doca_comch_client_pybind
 from doca_comch_client_pybind import CollectiveCommunication
 
-from mpi4py import MPI  # mpirun でランク情報を取る
-import run_zero  # 同じディレクトリの run_zero.py をインポート
+from mpi4py import MPI
+import run_zero
 
 
 def setup_env_from_mpi(master_addr=None, master_port=None):
@@ -38,8 +31,7 @@ def setup_env_from_mpi(master_addr=None, master_port=None):
     rank = comm.Get_rank()
     world_size = comm.Get_size()
 
-    # 単ノード or 各ノード同数 GPU 前提:
-    # local_rank は「GPU 枚数で割った余り」にする
+    # 単ノード or 各ノード同数 GPU 前提
     local_rank = rank
     try:
         import torch
@@ -51,15 +43,10 @@ def setup_env_from_mpi(master_addr=None, master_port=None):
         # torch がまだ使えない環境でも一応動くようにしておく
         pass
 
-    # torchrun が渡してくれるはずの環境変数を、自分で埋める
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["LOCAL_RANK"] = str(local_rank)
 
-    # MASTER_ADDR / MASTER_PORT は優先順位:
-    #   1) 関数引数 (CLI で渡した値)
-    #   2) すでに環境変数に入っている値
-    #   3) デフォルト値
     if master_addr is not None:
         os.environ["MASTER_ADDR"] = master_addr
     else:
@@ -112,7 +99,6 @@ def main():
     parser.add_argument("--max-live-parameters", type=float, default=1.5e8)
     args = parser.parse_args()
 
-    # ここで MPI から env を準備
     rank, world_size, local_rank = setup_env_from_mpi(
         master_addr=args.master_addr,
         master_port=args.master_port,
@@ -141,7 +127,6 @@ def main():
         from common import debug_params as dbg
         dbg.enable()
 
-    # あとは元の run_zero の学習本体をそのまま呼ぶだけ
     run_zero.run_zero(
         use_profiler=args.profiler,
         use_bf16=args.bf16,

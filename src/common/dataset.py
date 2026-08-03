@@ -4,10 +4,8 @@ import torch
 from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
 
-# 共通：ImageNetの正規化（転移学習との相性◎）
 IMAGENET_MEAN, IMAGENET_STD = (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
 
-# すべてのデータセットの既定root
 DEFAULT_ROOT = "/home/y-jinbo/HasegawaLab/performance_evaluation/common/data"
 
 
@@ -34,10 +32,7 @@ def _normalize_labels_and_count_classes(labels):
 
 def _split_by_class_indices(labels_zero_based, num_classes, train_per_class=None, train_ratio=None, seed=0):
     """クラスごとにインデックスを集約し、学習/評価へ分割（再現性あり）。
-    優先度: train_per_class > train_ratio
-      - train_per_class: 各クラスの学習枚数（例: 60）
-      - train_ratio: 各クラスの割合（例: 0.8）
-    どちらもNoneの場合のデフォルトは 60/クラス。
+    優先度: train_per_class > train_ratio。どちらも None なら 60/クラス。
     """
     rng = random.Random(seed)
     per_class_indices = [[] for _ in range(num_classes)]
@@ -53,7 +48,7 @@ def _split_by_class_indices(labels_zero_based, num_classes, train_per_class=None
         elif train_ratio is not None:
             k = int(len(idxs) * float(train_ratio))
         else:
-            k = min(60, len(idxs))  # デフォルト
+            k = min(60, len(idxs))
         train_idx.extend(idxs[:k])
         test_idx.extend(idxs[k:])
     return train_idx, test_idx
@@ -63,7 +58,6 @@ def get_dataloaders(
     dataset_name="CIFAR10",
     batch_size=32,
     num_workers=4,
-    # ★ 追加：224×224にリサイズするかどうか（主に CIFAR 用）
     resize_to_imagenet=False,
     # Caltech-256 用オプション
     caltech256_train_per_class=60,
@@ -110,10 +104,7 @@ def get_datasets(
     dataset_name="CIFAR10",
     batch_size=32,
     num_workers=4,
-    # ★ 追加：224×224にリサイズするかどうか（主に CIFAR 用）
     resize_to_imagenet=False,
-    # ★ 追加：CIFAR を resize_to_imagenet=True で使う際の crop サイズ
-    #    None の場合は従来通り 224
     cifar_img_size=None,
     # Caltech-256 用
     caltech256_train_per_class=60,
@@ -129,7 +120,6 @@ def get_datasets(
         mean, std = (0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)
 
         if not resize_to_imagenet:
-            # 従来通り 32x32 のまま
             train_transform = transforms.Compose([
                 transforms.RandomCrop(32, padding=4),
                 transforms.RandomHorizontalFlip(),
@@ -141,7 +131,6 @@ def get_datasets(
                 transforms.Normalize(mean, std),
             ])
         else:
-            # ★ 224相当にリサイズして重いモデル向けにする（cropは任意）
             img_size = 224 if cifar_img_size is None else int(cifar_img_size)
             train_transform = transforms.Compose([
                 transforms.Resize(256),
@@ -164,7 +153,6 @@ def get_datasets(
         mean, std = (0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)
 
         if not resize_to_imagenet:
-            # 従来通り 32x32 のまま
             train_transform = transforms.Compose([
                 transforms.RandomCrop(32, padding=4),
                 transforms.RandomHorizontalFlip(),
@@ -176,7 +164,6 @@ def get_datasets(
                 transforms.Normalize(mean, std),
             ])
         else:
-            # ★ 224相当にリサイズ（cropは任意）
             img_size = 224 if cifar_img_size is None else int(cifar_img_size)
             train_transform = transforms.Compose([
                 transforms.Resize(256),
@@ -256,23 +243,21 @@ def get_datasets(
         raw_labels = _get_targets(meta)
         labels_zero, num_classes = _normalize_labels_and_count_classes(raw_labels)
 
-        # 224 入力向けの一般的な前処理
         train_transform = transforms.Compose([
-            transforms.Lambda(lambda img: img.convert("RGB")),   # ★ 追加：3chに統一
+            transforms.Lambda(lambda img: img.convert("RGB")),
             transforms.RandomResizedCrop(224, scale=(0.6, 1.0), ratio=(3/4, 4/3)),
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
         ])
         test_transform = transforms.Compose([
-            transforms.Lambda(lambda img: img.convert("RGB")),   # ★ 追加：3chに統一
+            transforms.Lambda(lambda img: img.convert("RGB")),
             transforms.Resize(256),
             transforms.CenterCrop(224),
             transforms.ToTensor(),
             transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
         ])
 
-        # クラスごとに分割（60/クラスがデフォルト）
         train_idx, test_idx = _split_by_class_indices(
             labels_zero_based=labels_zero,
             num_classes=num_classes,
@@ -281,13 +266,11 @@ def get_datasets(
             seed=caltech256_seed,
         )
 
-        # Subsetに transform を与えて再構築
         base_train = datasets.Caltech256(root=root, download=False, transform=train_transform)
         base_test  = datasets.Caltech256(root=root, download=False, transform=test_transform)
         train_dataset = Subset(base_train, train_idx)
         test_dataset  = Subset(base_test,  test_idx)
 
-        # 手動DLが未完了でファイルが存在しない場合の親切メッセージ
         caltech_dir = os.path.join(root, "caltech256")
         if not os.path.exists(caltech_dir):
             print(f"[WARN] Caltech-256 expected under {caltech_dir}. "

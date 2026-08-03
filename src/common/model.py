@@ -1,4 +1,3 @@
-# common/model.py
 import os
 
 import torch.nn as nn
@@ -22,7 +21,6 @@ class TinyNN(nn.Module):
 
 
 def _make_resnet_cifar_stem(model: nn.Module) -> nn.Module:
-    # ImageNet stem: 7x7 s2 + maxpool を CIFAR stem: 3x3 s1 + no maxpool にする
     model.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
     model.maxpool = nn.Identity()
     return model
@@ -147,7 +145,6 @@ def _build_model(name: str, num_classes: int = 10, cifar_stem: bool = True):
         model.fc = nn.Linear(model.fc.in_features, num_classes)
         return model
 
-    # 追加：WideResNet50-2（コスパが良い “強い” 選択肢）
     elif name == "wide_resnet50_2":
         model = models.wide_resnet50_2(weights=None)
         model = _maybe_make_cifar_stem(model, cifar_stem)

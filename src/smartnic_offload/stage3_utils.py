@@ -20,7 +20,6 @@ param_names = {}
 
 
 def debug_extract_module_and_param_names(model):
-    # extract the fully qualified names as soon as the model is acquired
     global module_names
     global param_names
     module_names = {module: name for name, module in model.named_modules()}
@@ -70,25 +69,7 @@ def debug_param2name_id_shape_status(param):
 
 
 def printflock(*msgs):
-    """
-
-    For printing messages for all concurrent gpus w/o getting interleaved text.
-
-    This is useful when debugging issues where multi-gpus don't sync.
-
-    1. Enable the force debug in say partitioning and zero3 files
-    2. Override the usual versions with ::
-
-        def print_rank_0(message, debug=False, force=False):
-            rank = deepspeed.comm.get_rank()
-            printflock(f"[{rank}] {message}")
-    3. run the program and you get both logs non-interleaved
-
-    But this makes it very difficult to make sense of the output, so the ``log_rank_file`` helper
-    function might be more useful, as it's easier to send each log stream into a separate file and
-    then compare those.
-
-    """
+    """Print from concurrent gpus without interleaved text (flock-serialized)."""
     global fcntl
     if fcntl == None:
         import fcntl
@@ -105,29 +86,8 @@ fh = None
 
 
 def log_rank_file(rank, *msgs):
-    """
-    Print to a log file of the given rank
-
-    This is useful for debugging hanging in sync processes. Here is a possible workflow:
-
-    1. Enable the force debug in say partitioning and zero3 files
-    2. Override the usual versions of print_rank_0 in those files with ::
-
-        def print_rank_0(message, debug=False, force=False):
-            rank = deepspeed.comm.get_rank()
-            log_rank_file(rank, message)
-
-    3. run the program
-    4. fix up the expected differences, e.g. different cuda numbers ::
-
-        perl -pi -e 's|cuda:1|cuda:0|' log_rank_*
-
-    5. now diff and see where names and ids diverge - you will find where the gpus don't do the same
-    work (e.g. when some layers get conditionally skipped on one gpu but not all)
-
-        diff -u log_rank_0.txt log_rank_1.txt | less
-
-    """
+    """Print to a per-rank log file (log_rank_<rank>.txt). Useful for diffing
+    rank behavior when debugging sync hangs."""
     global fh
     if fh is None:
         fh = open(f"log_rank_{rank}.txt", "w")
@@ -163,7 +123,6 @@ def see_memory_usage(message, force=False):
     # python doesn't do real-time garbage collection so do it explicitly to get the correct RAM reports
     gc.collect()
 
-    # Print message except when distributed but not rank 0
     logger.info(message)
     logger.info(
         f"MA {round(torch.cuda.memory_allocated() / (1024 * 1024 * 1024),2 )} GB \
@@ -210,7 +169,6 @@ def get_lst_from_rank0(lst: List[int]) -> None:
     lst_tensor = torch.tensor(
         lst if dist.get_rank() == 0 else [-1] * len(lst),
         dtype=int,
-        # device=torch.cuda.current_device(),
         device=torch.device('cuda:{}'.format(os.environ["LOCAL_RANK"])),
         requires_grad=False,
     )
@@ -220,12 +178,8 @@ def get_lst_from_rank0(lst: List[int]) -> None:
 
 @instrument_w_nvtx
 def assert_ints_same_as_other_ranks(ints: List[int]) -> None:
-    """
-    NOTE: creates both communication and synchronization overhead so should be
-    used sparingly
-
-    takes a list of ints from each rank and ensures that they are the same
-    across ranks, throwing an exception if they are not.
+    """Ensure the given ints are identical across ranks (raises otherwise).
+    NOTE: communication + synchronization overhead — use sparingly.
     """
     rank0_ints = get_lst_from_rank0(ints)
     if ints != rank0_ints:

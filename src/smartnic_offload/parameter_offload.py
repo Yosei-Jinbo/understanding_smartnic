@@ -9,10 +9,8 @@ from partitioned_param_coordinator import PartitionedParameterCoordinator, iter_
 from stage3_utils import * #parameterの持ち方が違うため独自のmemory_usage関数を呼ぶ
 from common import submodule_timing as smt
 
-# ---- NVTX per-submodule ranges (USE_NVTX_RANGES=1 で有効) ----
-# nsys profile + `nsys stats --report nvtxkernsum` で
-# fwd:<name>, fwd_fetch:<name>, fwd_exec:<name>, bwd:<name>, bwd_fetch:<name>, bwd_exec:<name>
-# のレンジ別に CUDA kernel 実時間を集計できる。
+# NVTX per-submodule ranges (USE_NVTX_RANGES=1): fwd/bwd の fetch/exec を
+# レンジ別に nsys で集計できるようにする。
 _NVTX_ENABLED = os.environ.get("USE_NVTX_RANGES", "0") == "1"
 
 def _nvtx_name(sub_module) -> str:
@@ -61,8 +59,7 @@ class ZeroOrderedDict(OrderedDict):
                     force=False)
         return param
     
-#moduleのパラメータ管理をclsに置き換えている
-#moduleのパラメータにアクセスする際にはcls(ZeroOrderedDict)にアクセスするように変更する
+#module の _parameters を cls (ZeroOrderedDict) に置き換え、アクセスをフックする
 def _inject_parameters(module, cls):
     for module in module.modules():
         if cls == ZeroOrderedDict:
@@ -74,10 +71,8 @@ def _inject_parameters(module, cls):
             new_param[key] = param
         module._parameters = new_param
 
-#apply torch.autograd.Function that calls a backward_function to tensors in output
-#計算グラフにbackward_functionを差し込むために計算グラフのための出力を作って返す
-# PreBackwardFunction.apply(module, hook, outputs) でグラフにノード注入
-#常に先にこのノードの backward() → そこで pre‐backward 実行後、上流へ勾配を返す
+#outputs 内の Tensor に functional.apply(...) でノードを注入し、backward 到達時に
+#backward_function が先に実行されるようにする
 def _apply_to_tensors_only(module, functional, backward_function, outputs):
     if isinstance(outputs, (tuple, list)):
         touched_outputs = []
@@ -100,9 +95,7 @@ def _apply_to_tensors_only(module, functional, backward_function, outputs):
                 "output tensors and therefore may not get triggered properly.")
         return outputs
     
-#for each tensor in outputs run the forward_function and register backward_function as hook
-#forward_function(outputs) 実行 + outputs.register_hook(backward_function)
-#その Tensor に勾配が付く時にフック実行
+#outputs 内の各 Tensor に forward_function を適用し、backward_function を grad hook として登録
 def _apply_forward_and_backward_to_tensors_only(module, forward_function, backward_function, outputs):
     if type(outputs) is tuple:
         touched_outputs = []
@@ -118,33 +111,24 @@ def _apply_forward_and_backward_to_tensors_only(module, forward_function, backwa
     else:
         return outputs
 
-#Backwardの前でパラメータのAllGatherが発火するようにtorch.autograd.Functionを継承したクラスを作成して計算ノードに張り付ける
-#「そのモジュールの逆伝播が始まる直前に実行したい処理」を差し込む“入口フック”
+#モジュールの逆伝播が始まる直前に pre_backward_function を実行する“入口フック”
+#(backward 前のパラメータ AllGather 発火用)
 class PreBackwardFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, module, pre_backward_function, outputs):
         ctx.module = module
-        ctx.pre_backward_function = pre_backward_function #逆伝播で使うためにmoduleとコールバックpre_backward_functionをctxに保存
-        '''
-        このモジュールに対して 何回このフックが“適用”されたかの参照カウンタを増やします。
-        1モジュールの出力が複数テンソル（あるいは複数回ラップ）されるケースで、重複呼び出し制御やすべての出力で逆伝播が始まったかの判定に使えます。
-        '''
+        ctx.pre_backward_function = pre_backward_function
+        # 適用回数の参照カウンタ (出力が複数テンソルの場合の重複呼び出し制御用)
         if not hasattr(module, "applied_pre_backward_ref_cnt"):
             module.applied_pre_backward_ref_cnt = 0
         module.applied_pre_backward_ref_cnt += 1
         outputs = outputs.detach()
         return outputs
-    
+
     @staticmethod
     def backward(ctx, *args):
-        ctx.pre_backward_function(ctx.module) #逆伝播がこのノードに到達した瞬間に、保存しておいた pre_backward_function(module) を先に実行します（ここが“pre-backward”）
-        '''
-        つぎに勾配をそのまま通過させます。
-        forward の引数は (module, pre_backward_function, outputs) の3つでした。
-        backward は、各引数に対応する勾配を同じ順番で返す必要があります。
-        しかし module と pre_backward_function は Tensor ではないので 勾配は不要＝None を返します。
-        3番目の引数 outputs（Tensor）に対しては、下流から来た勾配 *args をそのまま返すことで、上流へ勾配をパスします。
-        '''
+        ctx.pre_backward_function(ctx.module)
+        # 非 Tensor 引数 (module, fn) には None、outputs には勾配をそのまま返す
         return (None, None) + args
 
 #「そのモジュールの逆伝播がすべて終わった時点で"一度だけ"実行したい処理」を差し込む“出口フック”
@@ -172,11 +156,8 @@ class ZeroOffload(object):
                  module,
                  timers,
                  overlap_comm=True,
-                 #prefetch_bucket_size=50000000,
                  prefetch_bucket_size=0,
-                 #max_reuse_distance=1000000000,
                  max_reuse_distance=0,
-                 #max_live_parameters=1000000000
                  max_live_parameters=0):
         
         see_memory_usage("ZeRoOffload initialize [begin]", force=True)
@@ -336,9 +317,7 @@ class ZeroOffload(object):
         def _pre_backward_module_hook(module, inputs, output):
             @instrument_w_nvtx
             def _run_before_backward_function(sub_module):
-                #backward の直前に実行したい処理を、カスタム autograd Function で呼び出すためのクロージャ。
-                #同一層の 複数回 forward→1 回 backward のケース（Albert 等）に備え、参照カウントで必要回数だけプリフェッチを行う設計
-                #print(f"COUNTER before: {sub_module.applied_pre_backward_ref_cnt}")
+                #同一層の複数回 forward→1回 backward (Albert 等) に備え、参照カウントで必要回数だけプリフェッチ
                 if sub_module.applied_pre_backward_ref_cnt > 0:
                     call_id = sub_module._timing_fwd_call_stack[-1] if sub_module._timing_fwd_call_stack else None
                     sub_module._timing_bwd_active_call = call_id
@@ -351,26 +330,20 @@ class ZeroOffload(object):
                     self.pre_sub_module_backward_function(sub_module)
                     sub_module.applied_pre_backward_ref_cnt -= 1
                     
-            #output 内の Tensor にだけ PreBackwardFunction（autograd.Function）を差し込み、
-            # backward 時に上の _run_before_backward_function が動くようにグラフへフックノードを仕込む。
+            #output 内の Tensor に PreBackwardFunction を差し込む
             return _apply_to_tensors_only(module,
                                         PreBackwardFunction,
                                         _run_before_backward_function,
                                         output)
             
         
-        #This is an alternate to doing _post_backward_module_hook
-        #it uses tensor.register_hook instead of using torch.autograd.Function
-        #多分必要ないと思います。見なくていいかも
+        #_post_backward_module_hook の代替 (tensor.register_hook 版、未使用)
         def _alternate_post_backward_module_hook(module, inputs):
             module.ds_grads_remaining = 0
-
-            #print(f"Before Forward {module.__class__.__name__}")
 
             def _run_after_backward_hook(*unused):
                 module.ds_grads_remaining = module.ds_grads_remaining - 1
                 if module.ds_grads_remaining == 0:
-                    #print(f"After backward {module.__class__.__name__}")
                     self.post_sub_module_backward_function(module)
 
             def _run_before_forward_function(input):
@@ -417,15 +390,8 @@ class ZeroOffload(object):
         
         
     def _ensure_pinned_cpu_full_param(self, param):
-        """
-        param.cpu_full_param を
-        - device='cpu'
-        - pin_memory=True
-        - shape/dtype が param.data と一致
-        になるように確保 or 再利用する。
-
-        戻り値: cpu_full (pinned CPU tensor)
-        """
+        """param.cpu_full_param として使う pinned CPU tensor (shape/dtype 一致) を
+        確保 or プールから再利用して返す。"""
         # 現在アクティブなバッファ
         cpu_full = getattr(param, "cpu_full_param", None)
         # プールしてある pinned バッファ
@@ -460,7 +426,6 @@ class ZeroOffload(object):
     
     @torch.no_grad()
     def pre_sub_module_forward_function(self, sub_module):
-        #print_rank_0(f"pre sub module forward function: {sub_module.__class__.__name__}", force=True)
         _nvtx_name_s = _nvtx_name(sub_module)
         _nvtx_push(f"fwd:{_nvtx_name_s}")
         see_memory_usage(f"Before sub module function {sub_module.__class__.__name__}", force=False)
@@ -477,11 +442,8 @@ class ZeroOffload(object):
             param_coordinator.record_module(sub_module)
 
         call_id = getattr(sub_module, "_timing_active_fwd_call", None)
-        # fwd_fetch: CPU wallclock (fetch_sub_module の CPU 実行時間)
-        # fwd_wait_stall: CUDA Event on compute stream
-        #   fetch_sub_module は内部で wait_stream(allgather_stream) を enqueue するので、
-        #   その前後に CUDA Event を挟めば compute stream が fetch 完了を待って
-        #   stall していた時間 = GPU が fetch のために idle だった時間 が取れる。
+        # fwd_fetch: CPU wallclock / fwd_wait_stall: CUDA Event で compute stream が
+        # fetch 完了待ちで idle だった時間を測る
         if call_id is not None:
             smt.start("fwd_fetch", sub_module, call_id=call_id)
             smt.start("fwd_wait_stall", sub_module, call_id=call_id)
@@ -531,8 +493,7 @@ class ZeroOffload(object):
         if param_coordinator.is_record_trace():
             param_coordinator.record_module(sub_module)
 
-        # bwd_fetch: CPU wallclock
-        # bwd_wait_stall: CUDA Event (compute stream の GPU 側 stall 時間)
+        # bwd_fetch: CPU wallclock / bwd_wait_stall: CUDA Event (compute stream の stall 時間)
         call_id = getattr(sub_module, "_timing_bwd_active_call", None)
         if call_id is not None:
             smt.start("bwd_fetch", sub_module, call_id=call_id)
