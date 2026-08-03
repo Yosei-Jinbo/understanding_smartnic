@@ -1,4 +1,3 @@
-import os
 
 import torch.nn as nn
 import torch.nn.functional as F
@@ -38,70 +37,8 @@ def _maybe_make_cifar_stem(model: nn.Module, cifar_stem: bool) -> nn.Module:
     return model
 
 
-def _wrap_forward_with_checkpoint(module: nn.Module) -> None:
-    """module.forward を torch.utils.checkpoint でラップする (activation を
-    保持せず bwd で再計算)。use_reentrant=False は再計算がサブモジュールの
-    __call__ を通るため、ZeRO-3 の gather/free フックと共存できる。"""
-    from torch.utils.checkpoint import checkpoint
-    orig = module.forward
-    module.forward = (lambda *args, _orig=orig, **kw:
-                      checkpoint(_orig, *args, use_reentrant=False, **kw))
-
-
-def _enable_gradient_checkpointing(model: nn.Module, name: str) -> None:
-    """GRAD_CKPT=1 のとき get_benchmark_model から呼ばれ、モデル系統ごとに
-    適切な粒度で gradient checkpointing を有効化する。
-    メモリ大幅減の代わりに fwd 再計算 (+~30% の計算) が bwd に入る。"""
-    # HF (transformers) モデル: 公式 API
-    if hasattr(model, "gradient_checkpointing_enable"):
-        model.gradient_checkpointing_enable(
-            gradient_checkpointing_kwargs={"use_reentrant": False})
-        print(f"[GRAD_CKPT] enabled (HF) for {name}")
-        return
-
-    # torchvision ViT: encoder ブロック単位
-    if hasattr(model, "encoder") and hasattr(model.encoder, "layers"):
-        for blk in model.encoder.layers:
-            _wrap_forward_with_checkpoint(blk)
-        print(f"[GRAD_CKPT] enabled (ViT, {len(model.encoder.layers)} blocks) "
-              f"for {name}")
-        return
-
-    # ResNet / ResNeXt / WideResNet: residual block 単位
-    stages = [getattr(model, f"layer{i}") for i in (1, 2, 3, 4)
-              if hasattr(model, f"layer{i}")]
-    if stages:
-        n = 0
-        for stage in stages:
-            for blk in stage:
-                _wrap_forward_with_checkpoint(blk)
-                n += 1
-        print(f"[GRAD_CKPT] enabled (ResNet, {n} blocks) for {name}")
-        return
-
-    # VGG 等の Sequential CNN: features を 4 セグメントに分割
-    # (層単位のラップでは各層入力=全 activation を保持してしまい意味がない)
-    if hasattr(model, "features") and isinstance(model.features, nn.Sequential):
-        from torch.utils.checkpoint import checkpoint_sequential
-        feats = model.features
-        # inplace ReLU はセグメント境界で保存したテンソルを上書きし
-        # bwd の再計算が壊れるため無効化する
-        for m in feats.modules():
-            if getattr(m, "inplace", False):
-                m.inplace = False
-        feats.forward = (lambda x, _f=feats:
-                         checkpoint_sequential(_f, 4, x, use_reentrant=False))
-        print(f"[GRAD_CKPT] enabled (Sequential, 4 segments) for {name}")
-        return
-
-    print(f"[GRAD_CKPT] WARNING: no checkpointing support for {name}, skipped")
-
-
 def get_benchmark_model(name: str, num_classes: int = 10, cifar_stem: bool = True):
-    model = _build_model(name, num_classes, cifar_stem)
-    if os.environ.get("GRAD_CKPT") == "1":
-        _enable_gradient_checkpointing(model, name.lower())
-    return model
+    return _build_model(name, num_classes, cifar_stem)
 
 
 def _build_model(name: str, num_classes: int = 10, cifar_stem: bool = True):

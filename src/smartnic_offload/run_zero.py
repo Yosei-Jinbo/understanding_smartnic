@@ -684,8 +684,7 @@ def run_zero(use_profiler=False,
                         _gfp.set_global_pool(None)
                     else:
                         if rank == 0:
-                            _storage = "GPU memory (Cross-GVMI)" if pool.on_gpu else "pinned host"
-                            print(f"[FlagPool] GPU flag wait enabled: size={pool.size} addr=0x{pool.base_addr:x} storage={_storage}")
+                            print(f"[FlagPool] GPU flag wait enabled: size={pool.size} addr=0x{pool.base_addr:x} storage=pinned host")
             except Exception as _e:
                 if rank == 0:
                     print(f"[FlagPool] init failed: {_e}")

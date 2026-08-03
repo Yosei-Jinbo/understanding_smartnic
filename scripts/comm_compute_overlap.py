@@ -165,14 +165,22 @@ def analyze(db):
             gaps_raw.append((ks[i][1], ks[i + 1][0]))
     dpu_wait = clip(merge([[a, b] for a, b in gaps_raw if b > a]), win)
 
-    # ---- チャネル別グループ (転送 memcpy を対応する collective に計上) ----
-    # AG = AG カーネル + param HtoD (+ SO では DPU-AG)、RS = RS カーネル + 勾配 DtoH
+    # ---- チャネル別グループ ----
+    # AG = AG カーネル (ZO) / DPU-AG wait (SO)、RS = RS カーネル。
+    # 転送 (param HtoD / grad DtoH) は独立の行として計上する:
+    #   ZO: データパスの一部なので comm には含める (行は AG/RS と別建て)
+    #   SO: データパスは DPU RDMA 経由で cudaMemcpy を通らないため、
+    #       観測される H2D/D2H は制御パス由来 → comm に含めない
     # グループ内の重なりを二重に数えないよう union で足す
-    ag_g = merge(ag + h2d + dpu_wait)
-    rs_g = merge(rs + d2h)
+    is_so = len(wait_ts) > 0
+    ag_g = merge(ag + dpu_wait)
+    rs_g = merge(rs)
 
     # ---- comm union と overlap ----
-    comm = merge(ag_g + rs_g + onc)
+    if is_so:
+        comm = merge(ag_g + rs_g + onc)
+    else:
+        comm = merge(ag_g + rs_g + onc + h2d + d2h)
 
     r.update(
         compute=tot(compute),
@@ -185,6 +193,7 @@ def analyze(db):
         ag_g=tot(ag_g),
         rs_g=tot(rs_g),
         n_wait=len(gaps_raw),
+        is_so=is_so,
         comm=tot(comm),
         ov=inter(compute, comm),
         wait_med=statistics.median(b - a for a, b in gaps_raw) if gaps_raw else None,
@@ -210,11 +219,11 @@ def fmt_table(results):
         ("compute", lambda r: f"{ms(r, 'compute')} ({pct(r['compute'], r['wall'])})"),
         ("AG 合計", lambda r: ms(r, "ag_g")),
         ("  AG kernel", lambda r: ms(r, "ag")),
-        ("  param HtoD", lambda r: ms(r, "h2d")),
         ("  DPU-AG wait", lambda r: ms(r, "dpu_wait")),
         ("RS 合計", lambda r: ms(r, "rs_g")),
         ("  RS kernel", lambda r: ms(r, "rs")),
-        ("  grad DtoH", lambda r: ms(r, "d2h")),
+        ("param HtoD", lambda r: "—" if r.get("is_so") else ms(r, "h2d")),
+        ("grad DtoH", lambda r: "—" if r.get("is_so") else ms(r, "d2h")),
         ("nccl other", lambda r: ms(r, "onc")),
         ("comm", lambda r: f"{ms(r, 'comm')} ({pct(r['comm'], r['wall'])})"),
         ("  隠蔽率", lambda r: pct(r["ov"], r["comm"])),

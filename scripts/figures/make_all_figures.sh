@@ -3,17 +3,14 @@
 # make_all_figures.sh — 全モデルの idle 分解図を一括生成する
 #
 # 処理の流れ:
-#   1. 各ノードで idle_decomp_allrank.py を走らせ、そのノードにあるランクを解析
-#   2. JSON を bluefield01 に集約
-#   3. plot_idle_decomp.py で 3 種類の図を生成
-#
-# ランクのノード配置は手法によって違う（prefetch は torchrun、ag_smartnic は
-# mpirun appfile で rank→host の割当が逆）。ハードコードすると片方が壊れるので、
-# 各ノードで <prefix>_rank*.sqlite を glob して「在るものを解析する」方式にしてある。
+#   1. idle_decomp_allrank.py でこのノード (bluefield01) にあるランクを解析
+#   2. plot_idle_decomp.py で 3 種類の図を生成
 #
 # 前提:
-#   logs/nsys/<prefix>_rank<N>.sqlite が両ノードに存在すること
-#   （nsys export --type sqlite で事前に変換しておく）
+#   bluefield01 に .nsys-rep が存在すること:
+#     baseline : logs/baseline/nsys-report/<prefix>_rank<N>.nsys-rep
+#     smartnic : logs/smartnic_offload/nsys-report/<prefix>_rank<N>.nsys-rep
+#   sqlite が無い/古い場合は自動で nsys export する。
 #
 # 使い方:
 #   bash scripts/figures/make_all_figures.sh                # 全モデル
@@ -23,42 +20,37 @@ set -u
 
 REPO=/home/y-jinbo/understanding_smartnic
 PY=/home/y-jinbo/.venv/bin/python
-NSYS_DIR=$REPO/logs/nsys
+NSYS_BIN=/usr/local/cuda/bin/nsys
+PF_DIR=$REPO/logs/baseline/nsys-report
+AG_DIR=$REPO/logs/smartnic_offload/nsys-report
 JSON_DIR=$REPO/logs/idle_decomp
 FIG_DIR=$REPO/scripts/figures
-REMOTE=bluefield02
-SELF=$(hostname -s)
 
 mkdir -p "$JSON_DIR"
 
 # model_key | prefetch prefix | offload prefix | label | ytick(busy) | ytick(idle) | ytick(other)
 MODELS=(
-  "opt_1_3b|opt_buf_prefetch|opt_ag_smartnic_allrank|OPT-1.3B|500|500|250"
+  "opt_1_3b|opt_buf_prefetch|opt_ag_smartnic|OPT-1.3B|500|500|250"
   "deberta_xl|deberta_xl_buf_prefetch|deberta_xl_ag_smartnic|DeBERTa-XL|500|500|250"
   "vit_l_16|vit_l_16_buf_prefetch|vit_l_16_ag_smartnic|ViT-L/16|250|250|100"
 )
 
-# $1=prefix $2=出力 JSON 名の接頭辞
+# $1=nsys-report ディレクトリ $2=prefix $3=出力 JSON 名の接頭辞
 analyze() {
-  local prefix=$1 tag=$2 out=()
-  for host in "$SELF" "$REMOTE"; do
-    local dst="$JSON_DIR/${tag}_${host}.json"
-    if [ "$host" = "$SELF" ]; then
-      local files
-      files=$(ls "$NSYS_DIR/${prefix}"_rank*.sqlite 2>/dev/null)
-      [ -z "$files" ] && continue
-      $PY "$REPO/scripts/idle_decomp_allrank.py" --label "$tag" --json "$dst" $files \
-        > /dev/null 2>&1 || { echo "  ★$host $prefix の解析失敗" >&2; continue; }
-    else
-      ssh "$host" "ls $NSYS_DIR/${prefix}_rank*.sqlite >/dev/null 2>&1 && \
-        $PY $REPO/scripts/idle_decomp_allrank.py --label $tag \
-          --json $NSYS_DIR/${tag}_remote.json \$(ls $NSYS_DIR/${prefix}_rank*.sqlite) \
-          > /dev/null 2>&1" || continue
-      scp -q "$host:$NSYS_DIR/${tag}_remote.json" "$dst" 2>/dev/null || continue
-    fi
-    out+=("$dst")
+  local dir=$1 prefix=$2 tag=$3
+  local dst="$JSON_DIR/${tag}.json"
+  local rep sq files
+  for rep in "$dir/${prefix}"_rank*.nsys-rep; do
+    [ -e "$rep" ] || continue
+    sq="${rep%.nsys-rep}.sqlite"
+    [ "$sq" -nt "$rep" ] || "$NSYS_BIN" export --type sqlite --force-overwrite true \
+      -o "$sq" "$rep" > /dev/null 2>&1
   done
-  echo "${out[@]}"
+  files=$(ls "$dir/${prefix}"_rank*.sqlite 2>/dev/null)
+  [ -z "$files" ] && return
+  $PY "$REPO/scripts/idle_decomp_allrank.py" --label "$tag" --json "$dst" $files \
+    > /dev/null 2>&1 || { echo "  ★$prefix の解析失敗" >&2; return; }
+  echo "$dst"
 }
 
 for spec in "${MODELS[@]}"; do
@@ -68,8 +60,8 @@ for spec in "${MODELS[@]}"; do
   fi
 
   echo "################ $label ################"
-  pf_json=$(analyze "$pf_prefix" "${key}_pf")
-  ag_json=$(analyze "$ag_prefix" "${key}_ag")
+  pf_json=$(analyze "$PF_DIR" "$pf_prefix" "${key}_pf")
+  ag_json=$(analyze "$AG_DIR" "$ag_prefix" "${key}_ag")
 
   if [ -z "$pf_json" ] || [ -z "$ag_json" ]; then
     echo "  ★スキップ: JSON が揃わなかった (pf='$pf_json' ag='$ag_json')"

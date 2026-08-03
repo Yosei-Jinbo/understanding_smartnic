@@ -105,13 +105,9 @@ ACC_APPFILE="$SCRIPT_DIR/logs/host_appfile_vit_l_16_${METHOD}_accuracy"
 # appfileへ環境変数を追加
 # ============================================================
 
-# GRAD_CKPTなどが環境にあれば、
-# appfileの各rankに-xで注入する。
+# 環境変数があれば appfile の各 rank に -x で注入する。
 #
 # 例:
-#
-#   GRAD_CKPT=1 \
-#       ./run_vit_accuracy.sh 5 ag_smartnic
 #
 #   USE_GPU_FLAG_WAIT=0 \
 #       ./run_vit_accuracy.sh 2 smartnic
@@ -119,7 +115,6 @@ ACC_APPFILE="$SCRIPT_DIR/logs/host_appfile_vit_l_16_${METHOD}_accuracy"
 X_FLAGS=""
 
 for VAR in \
-    GRAD_CKPT \
     PYTORCH_CUDA_ALLOC_CONF \
     USE_GPU_FLAG_WAIT \
     GPU_FLAG_POOL_SIZE

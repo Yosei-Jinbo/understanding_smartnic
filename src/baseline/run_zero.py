@@ -655,22 +655,10 @@ def run_zero(use_profiler=False, use_bf16=False, use_ema=False,
         # ------------------------
         # Training loop
         # ------------------------
-        # Phase 20: AG/RS stall event-bracket tracker (env: MEASURE_AG_STALL=1)
-        try:
-            from common import stall_event_tracker as _set
-            _stall_tracker = _set.get_global() if _set.is_enabled() else None
-        except Exception:
-            _stall_tracker = None
-        if _stall_tracker is not None:
-            print_rank_0("[Phase 20] AG/RS stall event-bracket tracker ENABLED "
-                         "(MEASURE_AG_STALL=1).")
-
         for epoch in range(epochs):
             train_sampler.set_epoch(epoch)
             zero_model.train()
             use_dpu = epoch > dpu_threshold
-            if _stall_tracker is not None:
-                _stall_tracker.set_epoch(epoch)
 
             if lr_scheduler is not None:
                 _lr_e = optimizer.param_groups[0]["lr"]
@@ -692,10 +680,6 @@ def run_zero(use_profiler=False, use_bf16=False, use_ema=False,
                     inputs = _move_batch_to_device(batch, device, is_causal_lm, is_mlm)
 
                     step_t0 = time.perf_counter()
-
-                    # Phase 20: tracker に現 iter を伝える
-                    if _stall_tracker is not None:
-                        _stall_tracker.set_iter(global_iter)
 
                     # nsys --capture-range=cudaProfilerApi 用: warmup 完了時にキャプチャ開始
                     if total_target_iters is not None and global_iter == WARMUP_STEPS:

@@ -8,50 +8,25 @@ After the AG completes, DPU writes `generation` to the slot via RDMA Write
 (before the doorbell). The compute stream's wait then unblocks, and downstream
 kernels execute. The Python thread never blocks in wait().
 
-Memory placement: **pinned host memory** (default)。
-  - GPU device memory 配置 (USE_GPU_FLAG_POOL_PCI=1) は wait overhead が
-    ~0.1ms/AG と速い (host 配置は ~1.8ms/AG) が、dual-rail 構成では
-    rail1 経由の AG データ書き込みと rail0 経由の flag 書き込みの到着順序が
-    保証されず、A4000 は CU_STREAM_WAIT_VALUE_FLUSH 非対応のため remote write の
-    可視性を強制できない → flag が立った時点でデータが未着になり得て
-    **精度が壊れる** (vit E1 で実測)。正しさ優先で host 配置を既定とする。
-  - host 配置は CUDA UVA で data_ptr() がそのまま device ポインタとして使え、
+Memory placement: pinned host memory 固定。
+  - CUDA UVA で data_ptr() がそのまま device ポインタとして使え、
     keep_alive の解放判定 (partition_parameters._sweep_flag_keepalive) も
     Python から直接安価に読める。
-  - GPU 配置時の flag_reached はダブルバッファ + CUDA event の非同期
-    スナップショット経由 (ホスト非ブロッキング。古い分は解放が遅れるだけで安全側)。
-
-Slot recycling:
-  - Pool size POOL_SIZE (default 4096) >> peak in-flight AGs (~32)
-  - Slots are reused round-robin
-  - Each reuse increments the slot's generation, so the (slot_id, gen) pair is
-    unique across the lifetime of training. cuStreamWaitValue(EQ, gen) for an
-    OLD generation is fine because by the time a slot is reused, the GPU has
-    already consumed the old AG result.
-
-Why generation as the value (not 1):
-  - Each AG using the same slot must have a UNIQUE wait value to avoid the
-    consumer stream matching a stale/future flag write.
-  - generation is monotonic and unique per slot.
+  - GPU device memory 配置は wait overhead は小さいが、dual-rail (既定) では
+    rail1 経由の AG データ書き込みと flag 書き込みの到着順序が保証されず
+    精度が壊れる (vit E1 で実測) ため採用しない。
 """
 
 from __future__ import annotations
 
-import os
 import threading
 from typing import Tuple
 
 import torch
 
 
-def _use_gpu_memory() -> bool:
-    """USE_GPU_FLAG_POOL_PCI=1 で GPU device memory に切替 (既定は pinned host)。
-    GPU 配置は速いが dual-rail でのデータ/flag 到着順序が保証されない (docstring 参照)。"""
-    return os.environ.get("USE_GPU_FLAG_POOL_PCI", "0") == "1"
-
-
 class GpuFlagPool:
-    """int32 completion flags (pinned host memory 既定, POOL_SIZE entries)."""
+    """int32 completion flags (pinned host memory, POOL_SIZE entries)."""
 
     def __init__(self, device: torch.device, size: int = 4096):
         if size <= 0 or (size & (size - 1)) != 0:
@@ -59,22 +34,8 @@ class GpuFlagPool:
         self._device = device
         self._size = size
         self._mask = size - 1
-        self._on_gpu = _use_gpu_memory()
-        if self._on_gpu:
-            self._flags = torch.zeros(size, dtype=torch.int32, device=device)
-            # flag_reached 用スナップショット (サイドストリームで D2H コピーして読む)。
-            # front = 完了確認済みで読み取り可 / back = コピー先。event 完了で swap。
-            self._stage_front = torch.zeros(size, dtype=torch.int32, pin_memory=True)
-            self._stage_back = torch.zeros(size, dtype=torch.int32, pin_memory=True)
-            self._snap_ev = None
-            self._copy_stream = torch.cuda.Stream(device=device)
-        else:
-            # pinned host memory (UVA accessible from device)
-            self._flags = torch.zeros(size, dtype=torch.int32, pin_memory=True)
-            self._stage_front = None
-            self._stage_back = None
-            self._snap_ev = None
-            self._copy_stream = None
+        # pinned host memory (UVA accessible from device)
+        self._flags = torch.zeros(size, dtype=torch.int32, pin_memory=True)
         self._base_addr = self._flags.data_ptr()
         self._gens = [0] * size  # per-slot monotonic generation counter
         self._next = 0
@@ -96,10 +57,6 @@ class GpuFlagPool:
     def device(self) -> torch.device:
         return self._device
 
-    @property
-    def on_gpu(self) -> bool:
-        return self._on_gpu
-
     def acquire(self) -> Tuple[int, int, int, int]:
         """Acquire the next slot.
 
@@ -107,7 +64,7 @@ class GpuFlagPool:
             (slot_id, generation, flag_addr, expected_value)
             - slot_id: index in [0, size)
             - generation: monotonic counter for this slot (also = expected_value)
-            - flag_addr: address of the int32 slot (GPU device ptr / pinned host UVA)
+            - flag_addr: address of the int32 slot (pinned host; UVA device ptr)
             - expected_value: value to wait for (== generation)
         """
         with self._lock:
@@ -120,31 +77,10 @@ class GpuFlagPool:
         flag_addr = self._base_addr + slot_id * 4
         return slot_id, gen, flag_addr, gen
 
-    def refresh_flags(self) -> None:
-        """flag 配列のスナップショットを更新する (GPU 配置時のみ実処理)。完全非ブロッキング:
-        前回発行した back へのコピーが event 完了していれば front と swap して確定させ、
-        次のコピーを非同期発行するだけ。ホストは一切待たない (D2H エンジンが勾配転送で
-        飽和していても sweep がブロックしない)。"""
-        if not self._on_gpu:
-            return
-        if self._snap_ev is not None:
-            if not self._snap_ev.query():
-                return  # back へのコピー進行中。front は安定なのでそのまま読める
-            # コピー完了 → back が最新スナップショット。front と交換して確定
-            self._stage_front, self._stage_back = self._stage_back, self._stage_front
-            self._snap_ev = None
-        with torch.cuda.stream(self._copy_stream):
-            self._stage_back.copy_(self._flags, non_blocking=True)
-            ev = torch.cuda.Event()
-            ev.record()
-        self._snap_ev = ev
-
     def flag_reached(self, slot_id: int, gen: int) -> bool:
         """slot の flag が gen 以上か (= その AG の DPU 側処理が完了済みか)。
-        GPU 配置時は確定済みスナップショット (front) を読む
-        (古い場合は False 側に倒れるだけで安全)。"""
-        src = self._stage_front if self._on_gpu else self._flags
-        return int(src[slot_id]) >= gen
+        pinned host memory の読みなので GPU 同期なしで安価。"""
+        return int(self._flags[slot_id]) >= gen
 
 
 # Global singleton (set by run_zero.py at startup)

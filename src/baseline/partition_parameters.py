@@ -145,34 +145,6 @@ def reset_ag_phase_stats() -> None:
     _AG_FWD_BLOCK_MS = _AG_BWD_BLOCK_MS = 0.0
     _AG_FWD_CALLS = _AG_BWD_CALLS = 0
 
-# ---- per-AG/RS event-bracket stall tracker (両 mode 対称) ----
-def _stall_bracket(wait_callable, params_list=None, op: str = "ag", num_bytes: int = 0):
-    """handle.wait() (cudaStreamWaitEvent enqueue) を CUDA event で囲み stream 上の真の stall ms を取得。
-    DISABLE_COMPLETION_POLLER=1 必須 (poller 経路は host polling になり計測不能)。"""
-    try:
-        from common import stall_event_tracker as _set  # type: ignore
-    except Exception:
-        return wait_callable()
-    if not _set.is_enabled():
-        return wait_callable()
-    tracker = _set.get_global()
-    if params_list:
-        try:
-            nbytes = sum(p.ds_numel * p.element_size() for p in params_list)
-        except Exception:
-            nbytes = num_bytes
-        ds_id = getattr(params_list[0], "ds_id", -1) if params_list else -1
-    else:
-        nbytes = num_bytes
-        ds_id = -1
-    stream = torch.cuda.current_stream()
-    handle = tracker.begin(stream, _AG_PHASE, op=op, ds_id=ds_id, payload_bytes=nbytes)
-    try:
-        return wait_callable()
-    finally:
-        tracker.end(handle)
-
-
 # ---- Per-AG detailed records for size-based analysis ----
 _AG_RECORDS: list = []
 _AG_RECORDS_LOCK = threading.Lock()
@@ -589,8 +561,7 @@ class AllGatherHandle:
             _record_ag_detail(nbytes, max(0.0, comm_ms), block_ms, 0.0, prefetch_lead_ms, wall_ms)
             _accumulate_phase_block(block_ms)
 
-        # cudaStreamWaitEvent の enqueue を stall 計測で bracket
-        _stall_bracket(instrument_w_nvtx(self.__handle.wait), [self.__param], op="ag")
+        instrument_w_nvtx(self.__handle.wait)()
         self.__param.ds_status = ZeroParamStatus.AVAILABLE
 
 class AllGatherCoalescedHandle:
@@ -631,9 +602,7 @@ class AllGatherCoalescedHandle:
             _record_ag_detail(nbytes, max(0.0, comm_ms), block_ms, 0.0, prefetch_lead_ms, wall_ms)
             _accumulate_phase_block(block_ms)
 
-        # NCCL 完了イベントへの cudaStreamWaitEvent を stall 計測で bracket
-        _stall_bracket(instrument_w_nvtx(self.__allgather_handle.wait),
-                       list(self.__params), op="ag")
+        instrument_w_nvtx(self.__allgather_handle.wait)()
         self.__t_request = None
 
         param_offset = 0

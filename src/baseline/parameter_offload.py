@@ -7,7 +7,6 @@ from partition_parameters import _init_external_params
 from partition_parameters import *
 from partitioned_param_coordinator import PartitionedParameterCoordinator, iter_params
 from stage3_utils import * #parameterの持ち方が違うため独自のmemory_usage関数を呼ぶ
-from common import submodule_timing as smt
 import time
 
 # H2D/D2H の転送時間は CUDA Event ベースの計測で取得する。
@@ -264,23 +263,12 @@ class ZeroOffload(object):
         my_count = count[0]
         module.id = my_count
         
-        smt.register_module_info(module)
-
-        module._timing_call_counter = 0
-        module._timing_fwd_call_stack = []      # forward 呼び出し順に push
-        module._timing_bwd_active_call = None   # backward 中に参照する call_id
-        
         for child in module.children():
             count[0] = count[0] + 1
             self._register_hooks_recursively(child, count=count)
         
         @instrument_w_nvtx
         def _pre_forward_module_hook(module, *args):
-            module._timing_call_counter += 1
-            call_id = module._timing_call_counter
-            module._timing_active_fwd_call = call_id
-            module._timing_fwd_call_stack.append(call_id)
-            
             self.pre_sub_module_forward_function(module)
             
         @instrument_w_nvtx
@@ -321,14 +309,6 @@ class ZeroOffload(object):
             def _run_before_backward_function(sub_module):
                 #同一層の 複数回 forward→1 回 backward のケース（Albert 等）に備え、参照カウントで必要回数だけプリフェッチを行う設計
                 if sub_module.applied_pre_backward_ref_cnt > 0:
-                    call_id = sub_module._timing_fwd_call_stack[-1] if sub_module._timing_fwd_call_stack else None
-                    sub_module._timing_bwd_active_call = call_id
-                    if call_id is not None:
-                        last = getattr(sub_module, "_timing_last_bwd_pre_call", None)
-                        if last == call_id:
-                            return
-                        sub_module._timing_last_bwd_pre_call = call_id
-                    
                     self.pre_sub_module_backward_function(sub_module)
                     sub_module.applied_pre_backward_ref_cnt -= 1
                     
@@ -364,16 +344,7 @@ class ZeroOffload(object):
             @instrument_w_nvtx
             def _run_after_backward_function(sub_module):
                 if sub_module.ds_grads_remaining == 0:
-                    call_id = getattr(sub_module, "_timing_bwd_active_call", None)
-                    if call_id is None and sub_module._timing_fwd_call_stack:
-                        call_id = sub_module._timing_fwd_call_stack[-1]
-                        sub_module._timing_bwd_active_call = call_id
-
                     self.post_sub_module_backward_function(sub_module)
-
-                    if sub_module._timing_fwd_call_stack:
-                        sub_module._timing_fwd_call_stack.pop()
-                    sub_module._timing_bwd_active_call = None
             
             return _apply_to_tensors_only(module,
                                           PostBackwardFunction,
@@ -437,35 +408,17 @@ class ZeroOffload(object):
         if param_coordinator.is_record_trace():
             param_coordinator.record_module(sub_module)
 
-        call_id = getattr(sub_module, "_timing_active_fwd_call", None)
-        # fwd_fetch: CPU wallclock (fetch_sub_module の CPU 実行時間)
-        # fwd_wait_stall: CUDA Event on compute stream
-        #   fetch_sub_module は内部で wait_stream(allgather_stream) を enqueue するので、
-        #   その前後に CUDA Event を挟めば compute stream が fetch 完了を待って
-        #   stall していた時間 = GPU が fetch のために idle だった時間 が取れる。
-        if call_id is not None:
-            smt.start("fwd_fetch", sub_module, call_id=call_id)
-            smt.start("fwd_wait_stall", sub_module, call_id=call_id)
         _nvtx_push(f"fwd_fetch:{_nvtx_name_s}")
         param_coordinator.fetch_sub_module(sub_module)
         _nvtx_pop()  # fwd_fetch
-        if call_id is not None:
-            smt.end("fwd_wait_stall", sub_module, call_id=call_id)
-            smt.end("fwd_fetch", sub_module, call_id=call_id)
-            
 
-        if call_id is not None:
-            smt.start("fwd_exec", sub_module, call_id=call_id)
         _nvtx_push(f"fwd_exec:{_nvtx_name_s}")
 
 
     @torch.no_grad()
     def post_sub_module_forward_function(self, sub_module):
         _nvtx_pop()  # fwd_exec
-        call_id = getattr(sub_module, "_timing_active_fwd_call", None)
-        if call_id is not None:
-            smt.end("fwd_exec", sub_module, call_id=call_id)
-            
+
         param_coordinator = self.get_param_coordinator(training=sub_module.training)
         params_to_release = (
                         param_coordinator.params_to_release_for_submodule(sub_module)
@@ -495,35 +448,20 @@ class ZeroOffload(object):
         if param_coordinator.is_record_trace():
             param_coordinator.record_module(sub_module)
 
-        # bwd_fetch: CPU wallclock
-        # bwd_wait_stall: CUDA Event (compute stream の GPU 側 stall 時間)
-        call_id = getattr(sub_module, "_timing_bwd_active_call", None)
-        if call_id is not None:
-            smt.start("bwd_fetch", sub_module, call_id=call_id)
-            smt.start("bwd_wait_stall", sub_module, call_id=call_id)
         _nvtx_push(f"bwd_fetch:{_nvtx_name_s}")
         param_coordinator.fetch_sub_module(sub_module)
         _nvtx_pop()  # bwd_fetch
-        if call_id is not None:
-            smt.end("bwd_wait_stall", sub_module, call_id=call_id)
-            smt.end("bwd_fetch", sub_module, call_id=call_id)
 
         from common import debug_params as dbg
         dbg.log_before_backward(sub_module)
 
-        if call_id is not None:
-            smt.start("bwd_exec", sub_module, call_id=call_id)
         _nvtx_push(f"bwd_exec:{_nvtx_name_s}")
 
 
     @torch.no_grad()
     def post_sub_module_backward_function(self, sub_module):
         _nvtx_pop()  # bwd_exec
-        call_id = getattr(sub_module, "_timing_bwd_active_call", None)
-        if call_id is not None:
-            smt.end("bwd_exec", sub_module, call_id=call_id)
-            
-                   
+
         param_coordinator = self.get_param_coordinator(training=sub_module.training)
         params_to_release = (
                         param_coordinator.params_to_release_for_submodule(sub_module)

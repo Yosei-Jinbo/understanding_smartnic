@@ -69,21 +69,16 @@ param_count = 0
 partitioned_param_data_shape = [0]
 zero_init_enabled = False
 
-# H2D (param shard CPU->GPU) の所要時間は Nsight Systems の cuda memcpy トレースで取得する。
 class _ComchHandleWork:
     """C 側の handle を保持して wait/release する Work。
 
     keep_alive: enqueue した src テンソル等を doorbell 完了 (=wait()) まで保持する。
     pybind 側は生アドレスしか持たないため、Python 側で参照を切らすとアロケータが
     バッファを再利用し、DPU が読む前に上書きされる use-after-free になる。
-    【必須】2026-07-18 実測: keep_alive なしで vit E1 0.3719→0.2674 に劣化 (実証済み)。
 
     GPU flag path (gpu_flag_addr != 0): wait() は cuStreamWaitValue32 を
     current stream に schedule して即 return する (Python はブロックしない)。
-    DPU は collective 完了時に flag_addr へ flag_value を RDMA Write するので、
-    後続 compute kernel は HW semaphore で AG 完了と同期する (NCCL と同じ semantics)。
-    この場合 keep_alive は _sweep_flag_keepalive の global deque が保持する
-    (wait() 即 return のためこの Work では DPU 読了を検知できない)。"""
+    """
     def __init__(self, handle: int, keep_alive=None,
                  gpu_flag_addr: int = 0,
                  gpu_flag_value: int = 0,
@@ -160,7 +155,6 @@ _flag_keepalive_q = collections.deque()  # (slot_id, gen, keep_alive)
 def _sweep_flag_keepalive(pool) -> None:
     if not _flag_keepalive_q:
         return
-    pool.refresh_flags()  # GPU 配置時: flag スナップショットを更新 (host 配置時 no-op)
     while _flag_keepalive_q:
         slot_id, gen, _ka = _flag_keepalive_q[0]
         if pool.flag_reached(slot_id, gen):

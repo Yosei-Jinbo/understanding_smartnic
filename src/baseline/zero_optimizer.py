@@ -138,29 +138,7 @@ def reduce_scatter_coalesced(
     from common import debug_params as dbg
     dbg.log_reduce_scatter(tensor_partition_flat_buffer, None, sub_group_id="flat_input")
 
-    # NCCL RS の enqueue + wait-event を stall 計測で bracket
-    try:
-        from common import stall_event_tracker as _set  # type: ignore
-    except Exception:
-        _set = None
-    if _set is not None and _set.is_enabled():
-        try:
-            from partition_parameters import _AG_PHASE as _PHASE  # type: ignore
-        except Exception:
-            _PHASE = "unknown"
-        _tracker = _set.get_global()
-        _stream = torch.cuda.current_stream()
-        _rs_nbytes = int(tensor_partition_flat_buffer.numel() *
-                         tensor_partition_flat_buffer.element_size())
-        _h = _tracker.begin(_stream, _PHASE, op="rs", ds_id=-1, payload_bytes=_rs_nbytes)
-        try:
-            _torch_reduce_scatter_fn(tensor_partition_flat_buffer,
-                                     tensor_partition_buffer_for_each_rank[this_rank],
-                                     group=group)
-        finally:
-            _tracker.end(_h)
-    else:
-        _torch_reduce_scatter_fn(tensor_partition_flat_buffer, tensor_partition_buffer_for_each_rank[this_rank], group=group)
+    _torch_reduce_scatter_fn(tensor_partition_flat_buffer, tensor_partition_buffer_for_each_rank[this_rank], group=group)
     # RS はストリーム順序で後続 op が完了を待つ (ホストは先行可能)。完了時刻は nsys の NCCL kernel トレース参照
 
     output_lst: List[Tensor] = [None] * len(tensors)

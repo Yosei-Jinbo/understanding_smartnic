@@ -3,8 +3,6 @@
 
 idle_decomp_detailed.py（rank0 単独）からの拡張点:
   1. 複数ランクを一度に処理し、ランク間のばらつき（min/max）まで出す
-     → 2026-07-28 の実測で step:barrier に最大 741ms のスキューがあり、
-       rank0 だけを見た分解は代表性に欠けることが判明したため。
   2. compute(busy) をカーネル名で内訳分解する（何を計算しているのか）
   3. アイドル側の各クラスもカーネル名まで下ろす（ag/rs/other_stream_kernel）
   4. "Other"(true_idle) を NVTX で特定したうえで、意味カテゴリに集約する
