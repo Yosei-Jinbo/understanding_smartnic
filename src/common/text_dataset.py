@@ -7,13 +7,9 @@ import torch
 from datasets import load_dataset
 from transformers import AutoTokenizer
 
-# ============================================================
-# トークナイズ結果のローカルキャッシュ
-# ============================================================
 # wikitext-103 の tokenization は 117M トークン × per-text Python loop で
 # 初回 2〜4 分かかる。(tokenizer, dataset, split) 単位で結果テンソルを
 # ローカルに pickle キャッシュすることで 2 回目以降は秒で済むようにする。
-#
 # キャッシュパスは TOKENIZED_CACHE_DIR で上書き可(デフォルト ~/.cache/hf_tokenized)。
 _TOKENIZED_CACHE_DIR = Path(
     os.environ.get("TOKENIZED_CACHE_DIR", Path.home() / ".cache" / "hf_tokenized")
@@ -112,9 +108,7 @@ def get_text_datasets(
     return train_dataset, test_dataset, tokenizer
 
 
-# ============================================================
 # Causal LM 用データセット (WikiText-103 等)
-# ============================================================
 class CausalLMDataset(torch.utils.data.Dataset):
     """テキスト全体をトークナイズし、固定長チャンクに分割した Causal LM 用データセット"""
 
@@ -152,16 +146,7 @@ def get_causal_lm_datasets(
     model_name="opt-1.3b",
     seq_len=1024,
 ):
-    """
-    WikiText-103 等の Causal LM データセットを返す。
-
-    Args:
-        dataset_name: "wikitext-103" or HuggingFace dataset name
-        model_name: モデル名 (トークナイザの自動選択に使用)
-        seq_len: 1チャンクのトークン数
-    Returns:
-        (train_dataset, test_dataset, tokenizer)
-    """
+    """WikiText-103 等の Causal LM データセットを返す。"""
     if dataset_name in ("wikitext-103", "wikitext_103"):
         dataset_id = "wikitext-103-raw-v1"
     else:
@@ -207,10 +192,7 @@ def get_causal_lm_datasets(
     return train_dataset, test_dataset, tokenizer
 
 
-# =========================================================================
 # Masked Language Model (DeBERTa 等)
-# =========================================================================
-
 _MLM_TOKENIZERS = {
     "deberta-xl": "microsoft/deberta-xlarge",
     "deberta_xl": "microsoft/deberta-xlarge",

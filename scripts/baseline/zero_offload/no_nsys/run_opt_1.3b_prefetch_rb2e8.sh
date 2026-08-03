@@ -1,8 +1,8 @@
 #!/bin/bash
-# OPT-1.3B 純粋 ZeRO-3 (--no-offload) prefetch [prod 非計装]
-# ZeRO-Offload 版 (run_opt_1.3b_zero3.sh) との差分は --no-offload のみ。
-# bluefield01: run_opt_1.3b_zero3.sh 0 | tee logs/opt_1.3b_prefetch.log
-# bluefield02: run_opt_1.3b_zero3.sh 1
+# OPT-1.3B prefetch + full param転送有効
+# メモリ逼迫検証用: RB/PB/MLP を 2e8 に縮小 (他は run_opt_1.3b_prefetch.sh と同一)
+# bluefield01: run_opt_1.3b_prefetch_rb2e8.sh 0 | tee logs/opt_1.3b_prefetch.log
+# bluefield02: run_opt_1.3b_prefetch_rb2e8.sh 1
 
 NODE_RANK=${1:?Usage: $0 <node_rank: 0=bluefield01, 1=bluefield02>}
 
@@ -26,9 +26,8 @@ torchrun \
     --dataset wikitext-103 \
     --batch-size 2 \
     --warmup-iters 10 \
-    --measure-iters 100 \
+    --measure-iters 30 \
     --seq-len 1024 \
-    --reduce-bucket-size 5e8 \
-    --prefetch-bucket-size 5e8 \
-    --max-live-parameters 5e8 \
-    --no-offload
+    --reduce-bucket-size 2e8 \
+    --prefetch-bucket-size 2e8 \
+    --max-live-parameters 2e8

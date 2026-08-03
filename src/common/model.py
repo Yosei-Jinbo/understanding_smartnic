@@ -1,38 +1,9 @@
 # common/model.py
+import os
+
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as models
-
-
-class SimpleCNN(nn.Module):
-    def __init__(self, num_classes=10):
-        super(SimpleCNN, self).__init__()
-        self.conv1 = nn.Conv2d(3, 32, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
-        self.pool = nn.MaxPool2d(2, 2)
-        self.fc1 = nn.Linear(64 * 8 * 8, 256)
-        self.fc2 = nn.Linear(256, num_classes)
-
-    def forward(self, x):
-        x = self.pool(F.relu(self.conv1(x)))
-        x = self.pool(F.relu(self.conv2(x)))
-        x = x.view(x.size(0), -1)
-        x = F.relu(self.fc1(x))
-        x = self.fc2(x)
-        return x
-
-
-class SimpleNN(nn.Module):
-    def __init__(self, input_size=28 * 28, hidden_size=128, num_classes=10):
-        super(SimpleNN, self).__init__()
-        self.fc1 = nn.Linear(input_size, hidden_size)
-        self.fc2 = nn.Linear(hidden_size, num_classes)
-
-    def forward(self, x):
-        x = x.view(x.size(0), -1)
-        x = F.relu(self.fc1(x))
-        x = self.fc2(x)
-        return x
 
 
 class TinyNN(nn.Module):
@@ -69,12 +40,76 @@ def _maybe_make_cifar_stem(model: nn.Module, cifar_stem: bool) -> nn.Module:
     return model
 
 
+def _wrap_forward_with_checkpoint(module: nn.Module) -> None:
+    """module.forward を torch.utils.checkpoint でラップする (activation を
+    保持せず bwd で再計算)。use_reentrant=False は再計算がサブモジュールの
+    __call__ を通るため、ZeRO-3 の gather/free フックと共存できる。"""
+    from torch.utils.checkpoint import checkpoint
+    orig = module.forward
+    module.forward = (lambda *args, _orig=orig, **kw:
+                      checkpoint(_orig, *args, use_reentrant=False, **kw))
+
+
+def _enable_gradient_checkpointing(model: nn.Module, name: str) -> None:
+    """GRAD_CKPT=1 のとき get_benchmark_model から呼ばれ、モデル系統ごとに
+    適切な粒度で gradient checkpointing を有効化する。
+    メモリ大幅減の代わりに fwd 再計算 (+~30% の計算) が bwd に入る。"""
+    # HF (transformers) モデル: 公式 API
+    if hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False})
+        print(f"[GRAD_CKPT] enabled (HF) for {name}")
+        return
+
+    # torchvision ViT: encoder ブロック単位
+    if hasattr(model, "encoder") and hasattr(model.encoder, "layers"):
+        for blk in model.encoder.layers:
+            _wrap_forward_with_checkpoint(blk)
+        print(f"[GRAD_CKPT] enabled (ViT, {len(model.encoder.layers)} blocks) "
+              f"for {name}")
+        return
+
+    # ResNet / ResNeXt / WideResNet: residual block 単位
+    stages = [getattr(model, f"layer{i}") for i in (1, 2, 3, 4)
+              if hasattr(model, f"layer{i}")]
+    if stages:
+        n = 0
+        for stage in stages:
+            for blk in stage:
+                _wrap_forward_with_checkpoint(blk)
+                n += 1
+        print(f"[GRAD_CKPT] enabled (ResNet, {n} blocks) for {name}")
+        return
+
+    # VGG 等の Sequential CNN: features を 4 セグメントに分割
+    # (層単位のラップでは各層入力=全 activation を保持してしまい意味がない)
+    if hasattr(model, "features") and isinstance(model.features, nn.Sequential):
+        from torch.utils.checkpoint import checkpoint_sequential
+        feats = model.features
+        # inplace ReLU はセグメント境界で保存したテンソルを上書きし
+        # bwd の再計算が壊れるため無効化する
+        for m in feats.modules():
+            if getattr(m, "inplace", False):
+                m.inplace = False
+        feats.forward = (lambda x, _f=feats:
+                         checkpoint_sequential(_f, 4, x, use_reentrant=False))
+        print(f"[GRAD_CKPT] enabled (Sequential, 4 segments) for {name}")
+        return
+
+    print(f"[GRAD_CKPT] WARNING: no checkpointing support for {name}, skipped")
+
+
 def get_benchmark_model(name: str, num_classes: int = 10, cifar_stem: bool = True):
+    model = _build_model(name, num_classes, cifar_stem)
+    if os.environ.get("GRAD_CKPT") == "1":
+        _enable_gradient_checkpointing(model, name.lower())
+    return model
+
+
+def _build_model(name: str, num_classes: int = 10, cifar_stem: bool = True):
     name = name.lower()
 
-    # -------------------------
     # ResNet family
-    # -------------------------
     if name == "resnet18":
         model = models.resnet18(weights=None)
         model = _maybe_make_cifar_stem(model, cifar_stem)
@@ -105,9 +140,7 @@ def get_benchmark_model(name: str, num_classes: int = 10, cifar_stem: bool = Tru
         model.fc = nn.Linear(model.fc.in_features, num_classes)
         return model
 
-    # -------------------------
     # ResNeXt / WideResNet family
-    # -------------------------
     elif name == "resnext101_32x8d":
         model = models.resnext101_32x8d(weights=None)
         model = _maybe_make_cifar_stem(model, cifar_stem)
@@ -127,9 +160,7 @@ def get_benchmark_model(name: str, num_classes: int = 10, cifar_stem: bool = Tru
         model.fc = nn.Linear(model.fc.in_features, num_classes)
         return model
 
-    # -------------------------
     # VGG
-    # -------------------------
     elif name == "vgg16":
         model = models.vgg16(weights=None)
         model.classifier[6] = nn.Linear(4096, num_classes)
@@ -140,9 +171,7 @@ def get_benchmark_model(name: str, num_classes: int = 10, cifar_stem: bool = Tru
         model.classifier[6] = nn.Linear(4096, num_classes)
         return model
 
-    # -------------------------
     # ViT (CIFARでは resize_to_imagenet=True 前提になりがち)
-    # -------------------------
     elif name == "vit_b_16":
         model = models.vit_b_16(weights=None)
         model.heads.head = nn.Linear(model.heads.head.in_features, num_classes)
@@ -153,9 +182,7 @@ def get_benchmark_model(name: str, num_classes: int = 10, cifar_stem: bool = Tru
         model.heads.head = nn.Linear(model.heads.head.in_features, num_classes)
         return model
     
-    # -------------------------
     # DistilBERT (Text)
-    # -------------------------
     elif name in ("distilbert", "distilbert-base-uncased"):
         from transformers import AutoModelForSequenceClassification
         model = AutoModelForSequenceClassification.from_pretrained(
@@ -198,9 +225,7 @@ def get_benchmark_model(name: str, num_classes: int = 10, cifar_stem: bool = Tru
         )
         return model
 
-    # -------------------------
     # Causal LM (OPT, LLaMA)
-    # -------------------------
     elif name in ("opt-1.3b", "opt_1.3b"):
         from transformers import AutoModelForCausalLM
         model = AutoModelForCausalLM.from_pretrained("facebook/opt-1.3b")
@@ -222,9 +247,7 @@ def get_benchmark_model(name: str, num_classes: int = 10, cifar_stem: bool = Tru
         model.config.use_cache = False  # 学習時はKVキャッシュ不要（DynamicCache警告回避）
         return model
 
-    # -------------------------
     # Masked LM (DeBERTa)
-    # -------------------------
     elif name in ("deberta-xl", "deberta_xl"):
         from transformers import AutoModelForMaskedLM
         model = AutoModelForMaskedLM.from_pretrained("microsoft/deberta-xlarge")
@@ -241,9 +264,7 @@ def get_benchmark_model(name: str, num_classes: int = 10, cifar_stem: bool = Tru
                 module.get_rel_embedding = _patched
         return model
 
-    # -------------------------
     # TinyNN (デバッグ用)
-    # -------------------------
     elif name == "tinynn":
         return TinyNN()
 

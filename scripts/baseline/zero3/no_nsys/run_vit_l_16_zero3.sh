@@ -1,8 +1,8 @@
 #!/bin/bash
-# OPT-1.3B prefetch + full param転送有効
-# メモリ逼迫検証用: RB/PB/MLP を 2e8 に縮小 (他は run_opt_1.3b_prefetch.sh と同一)
-# bluefield01: run_opt_1.3b_prefetch_rb2e8.sh 0 | tee logs/opt_1.3b_prefetch.log
-# bluefield02: run_opt_1.3b_prefetch_rb2e8.sh 1
+# ViT-L/16 純粋 ZeRO-3 (全 GPU 常駐, in-process GPU Adam, --no-offload) prefetch [prod 非計装]
+# ZeRO-Offload 版 (run_vit_l_16_prefetch.sh) との差分は --no-offload のみ。
+# bluefield01: run_vit_l_16_zero3.sh 0 | tee logs/vit_l_16_zero3.log
+# bluefield02: run_vit_l_16_zero3.sh 1
 
 NODE_RANK=${1:?Usage: $0 <node_rank: 0=bluefield01, 1=bluefield02>}
 
@@ -22,12 +22,12 @@ torchrun \
   --master_addr=172.16.0.1 \
   --master_port=29500 \
   /home/y-jinbo/understanding_smartnic/src/baseline/run_zero.py \
-    --model opt-1.3b \
-    --dataset wikitext-103 \
-    --batch-size 2 \
+    --model vit_l_16 \
+    --dataset cifar10 \
+    --batch-size 64 \
     --warmup-iters 10 \
-    --measure-iters 100 \
-    --seq-len 1024 \
-    --reduce-bucket-size 2e8 \
-    --prefetch-bucket-size 2e8 \
-    --max-live-parameters 2e8
+    --measure-iters 30 \
+    --reduce-bucket-size 1e8 \
+    --prefetch-bucket-size 1e8 \
+    --max-live-parameters 1.5e8 \
+    --no-offload

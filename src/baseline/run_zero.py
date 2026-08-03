@@ -8,7 +8,6 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import time
 import contextlib
 from datetime import timedelta
-import threading
 import torch
 import torch.nn as nn
 import torch.distributed as dist
@@ -19,18 +18,13 @@ import nvtx as pnvtx
 from common.dataset import get_datasets
 from common.model import get_benchmark_model
 from common.utils import (
-    ThroughputMeter,
     memory_usage_rank,
     start_profiler,
-    evaluate_zero3,
     SynchronizedWallClockTimer,
 )
 from zero_wrapper_example import ZeroWrapperExample
 from deepspeed.ops.adam import DeepSpeedCPUAdam
 from mpi4py import MPI
-import glob
-import re
-from common import submodule_timing as smt
 from transformers import DataCollatorWithPadding
 from common.text_dataset import get_text_datasets
 
@@ -42,6 +36,14 @@ import logging
 logger = logging.getLogger(__name__)
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+
+def print_rank_0(message: str):
+    if dist.is_initialized():
+        if dist.get_rank() == 0:
+            logger.info(message)
+    else:
+        logger.info(message)
 
 
 # ---- ステップ内訳 NVTX (STEP_NVTX=1 で有効) ----
@@ -59,14 +61,6 @@ def _step_push(label: str) -> None:
 def _step_pop() -> None:
     if _STEP_NVTX:
         torch.cuda.nvtx.range_pop()
-
-
-def print_rank_0(message: str):
-    if dist.is_initialized():
-        if dist.get_rank() == 0:
-            logger.info(message)
-    else:
-        logger.info(message)
 
 
 def instrument_w_nvtx(func):
@@ -139,57 +133,23 @@ def set_seed(seed: int, rank: int):
     torch.cuda.manual_seed_all(seed)
 
 
-def lower_thread_priority(nice=10):
-    try:
-        tid = threading.get_native_id()
-        os.setpriority(os.PRIO_PROCESS, tid, nice)
-    except Exception:
-        pass
-
-def _read_first_int(path: str, default: int = -1) -> int:
-    try:
-        with open(path, "r") as f:
-            return int(f.read().strip())
-    except Exception:
-        return default
-
-
-def _cuda_pci_bus_id_hex(local_rank: int) -> str:
-    """
-    PyTorch の device properties から PCI bus id を得る。
-    返り値例: '0000:65:00.0'
-    """
-    try:
-        prop = torch.cuda.get_device_properties(local_rank)
-        # PyTorch によっては pci_bus_id がある
-        if hasattr(prop, "pci_bus_id"):
-            return str(prop.pci_bus_id)
-        # ない場合は NVML 等が必要になるが、ここではフォールバック
-    except Exception:
-        pass
-    return ""
-
-
-def _pci_sysfs_path_from_bus_id(bus_id: str) -> str:
-    """
-    /sys/bus/pci/devices/<bus_id>
-    """
-    if not bus_id:
-        return ""
-    p = f"/sys/bus/pci/devices/{bus_id}"
-    return p if os.path.exists(p) else ""
-
-
-def get_gpu_numa_node(local_rank: int) -> int:
-    """
-    GPU の PCI デバイスが属する NUMA node を sysfs から推定。
-    失敗時は -1 を返す。
-    """
-    bus_id = _cuda_pci_bus_id_hex(local_rank)
-    sysfs = _pci_sysfs_path_from_bus_id(bus_id)
-    if not sysfs:
-        return -1
-    return _read_first_int(os.path.join(sysfs, "numa_node"), default=-1)
+def dump_final_params(model, rank: int, path_prefix: str):
+    """訓練後の各パラメータのローカルシャード (ds_tensor) を ds_id 順に連結し、
+    ビット再現性検証用に <path_prefix>.rank<rank>.pt へ保存 + sha256 を表示する。
+    _DmaCompletionPoller 削除のような「数値に影響しないはずの変更」の前後で、
+    このハッシュが完全一致することを確認するためのもの。"""
+    import hashlib
+    shards = []
+    for p in sorted(model.parameters(), key=lambda x: getattr(x, "ds_id", -1)):
+        t = getattr(p, "ds_tensor", None)
+        src = t if t is not None else p.data
+        shards.append(src.detach().to(torch.float32).cpu().contiguous().view(-1))
+    flat = torch.cat(shards) if shards else torch.empty(0)
+    out = f"{path_prefix}.rank{rank}.pt"
+    torch.save(flat, out)
+    h = hashlib.sha256(flat.numpy().tobytes()).hexdigest()
+    print(f"[DUMP_FINAL_PARAMS] rank={rank} numel={flat.numel()} "
+          f"sha256={h} -> {out}", flush=True)
 
 
 def get_allowed_cpus():
@@ -251,148 +211,336 @@ def choose_rank_cpu_sets(rank: int, world_size: int, allowed_cpus,
     main_set = rset[:-k] if len(rset) > k else rset
     return main_set, cpu_set
 
-def set_affinity_for_tid(tid: int, cpu_ids):
-    try:
-        os.sched_setaffinity(tid, set(cpu_ids))
-        return True
-    except Exception as e:
-        print_rank_0(f"[AFFINITY] failed tid={tid} cpus={cpu_ids}: {e}")
-        return False
+# ------------------------------------------------------------
+# 学習本体を構成するヘルパ (モジュールレベル)
+# ------------------------------------------------------------
+
+# Causal LM / MLM モデル判定
+CAUSAL_LM_MODELS = {"opt-1.3b", "opt_1.3b", "llama-3b", "llama_3b", "llama-7b", "llama_7b", "llama-2-7b"}
+MLM_MODELS = {"deberta-xl", "deberta_xl"}
 
 
-def _nvml_try_get_bus_id(local_rank: int) -> str:
-    """
-    NVMLが使えるなら GPU index -> PCI BusId (BDF) を取得する。
-    例: '00000000:65:00.0' or '0000:65:00.0'
-    """
-    try:
-        import pynvml
-
-        pynvml.nvmlInit()
-        h = pynvml.nvmlDeviceGetHandleByIndex(local_rank)
-        pci = pynvml.nvmlDeviceGetPciInfo(h)
-        bus_id = pci.busId.decode() if isinstance(pci.busId, (bytes, bytearray)) else str(pci.busId)
-        # '00000000:65:00.0' -> '0000:65:00.0'
-        if bus_id.startswith("00000000:"):
-            bus_id = "0000:" + bus_id.split(":", 1)[1]
-        # 念のため正規化
-        m = re.match(r"^([0-9a-fA-F]{4}):([0-9a-fA-F]{2}):([0-9a-fA-F]{2})\.([0-7])$", bus_id)
-        if m:
-            return f"{m.group(1).lower()}:{m.group(2).lower()}:{m.group(3).lower()}.{m.group(4)}"
-        return bus_id
-    except Exception:
-        return ""
-
-
-def _sysfs_find_bdf_by_bus_only(bus_dec: int) -> str:
-    """
-    PyTorch が返す pci_bus_id が「バス番号(10進)のみ」だった場合の救済。
-    /sys/bus/pci/devices/* の BDF を走査して、bus が一致するものを探す。
-    例: bus_dec=101 -> bus_hex='65' -> '0000:65:00.0' 等を返す。
-
-    注意: 同一busに複数デバイスがある環境では曖昧になり得る。
-          その場合は NVML 経由を推奨。
-    """
-    bus_hex = f"{bus_dec:02x}"
-    cands = glob.glob(f"/sys/bus/pci/devices/*:{bus_hex}:*")
-    # cands の例: '/sys/bus/pci/devices/0000:65:00.0'
-    if not cands:
-        return ""
-    # numa_node が -1 でないものを優先（取れない環境もある）
-    best = ""
-    for p in sorted(cands):
-        nn = _read_first_int(os.path.join(p, "numa_node"), default=-1)
-        if nn >= 0:
-            best = p
-            break
-    if not best:
-        best = sorted(cands)[0]
-    return os.path.basename(best)
+def _build_datasets(model_name, dataset_name, batch_size, num_workers, seq_len,
+                    is_causal_lm, is_mlm):
+    """モデル種別に応じて (train_dataset, test_dataset) を返す。"""
+    if model_name.lower() == "tinynn":
+        num_train_samples = 256
+        num_test_samples = 64
+        train_dataset = TensorDataset(
+            torch.randn(num_train_samples, 4),
+            torch.randint(0, 4, (num_train_samples,)),
+        )
+        test_dataset = TensorDataset(
+            torch.randn(num_test_samples, 4),
+            torch.randint(0, 4, (num_test_samples,)),
+        )
+    elif is_causal_lm:
+        from common.text_dataset import get_causal_lm_datasets
+        train_dataset, test_dataset, _tokenizer = get_causal_lm_datasets(
+            dataset_name=dataset_name,
+            model_name=model_name,
+            seq_len=seq_len,
+        )
+    elif is_mlm:
+        from common.text_dataset import get_mlm_datasets
+        train_dataset, test_dataset, _tokenizer = get_mlm_datasets(
+            dataset_name=dataset_name,
+            model_name=model_name,
+            seq_len=seq_len,
+        )
+    else:
+        train_dataset, test_dataset = get_datasets(
+            dataset_name,
+            batch_size,
+            num_workers,
+            resize_to_imagenet=True, #ViT用
+            #resize_to_imagenet=False, #ResNet用
+        )
+    return train_dataset, test_dataset
 
 
-def get_gpu_numa_node(local_rank: int) -> int:
-    """
-    GPU が属する NUMA node を推定。
-    優先順:
-      1) NVML で正しい BDF を取って sysfs を引く
-      2) PyTorch の pci_bus_id が整数(=bus番号)なら sysfs を走査して BDF を推定
-    """
-    # 1) NVML
-    bdf = _nvml_try_get_bus_id(local_rank)
-    if bdf:
-        p = f"/sys/bus/pci/devices/{bdf}"
-        if os.path.exists(p):
-            return _read_first_int(os.path.join(p, "numa_node"), default=-1)
-
-    # 2) PyTorch fallback（あなたのログのケース：23, 101）
-    try:
-        prop = torch.cuda.get_device_properties(local_rank)
-        if hasattr(prop, "pci_bus_id"):
-            bus = prop.pci_bus_id
-            # bus が int の想定
-            if isinstance(bus, int):
-                bdf2 = _sysfs_find_bdf_by_bus_only(bus)
-                if bdf2:
-                    p2 = f"/sys/bus/pci/devices/{bdf2}"
-                    return _read_first_int(os.path.join(p2, "numa_node"), default=-1)
-    except Exception:
-        pass
-
-    return -1
-
-def summarize_by_submodule():
-    stats = smt.snapshot(flush_cuda=True)
-
-    phases = (
-        "fwd_fetch", "fwd_wait_stall", "fwd_exec",
-        "bwd_fetch", "bwd_wait_stall", "bwd_exec",
+def _build_data_loaders(train_dataset, test_dataset, batch_size, num_workers,
+                        rank, world_size):
+    """train は rank 分割 (DistributedSampler)、test は全 rank 複製で
+    (train_sampler, train_loader, test_loader) を返す。"""
+    train_sampler = DistributedSampler(
+        train_dataset, num_replicas=world_size, rank=rank, shuffle=True
     )
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        sampler=train_sampler,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=(num_workers > 0),
+        drop_last=True,
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=(num_workers > 0),
+    )
+    return train_sampler, train_loader, test_loader
 
-    # module_id を集める
-    module_ids = {mid for (_, mid) in stats.keys()}
 
-    out = {}
+def _bind_cpu_sets(rank, world_size, local_rank, num_workers):
+    """rank → GPU → NUMA node に基づき CPU set を分割し、main 側に setaffinity する。
+    (main_cpu_set, cpu_thread_set) を返す。
+    この環境では GPU は常に NUMA node 1 に接続されているため直書きする。"""
+    gpu_node = 1
+    allowed_cpus = get_allowed_cpus()
+    cpu_thread_cores = int(os.environ.get("CPU_THREAD_CORES", "2"))
+    local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE",
+                           os.environ.get("OMPI_COMM_WORLD_LOCAL_SIZE", "1")))
+    main_cpu_set, cpu_thread_set = choose_rank_cpu_sets(
+        rank=rank, world_size=world_size, allowed_cpus=allowed_cpus,
+        cpu_thread_cores=cpu_thread_cores,
+        gpu_numa_node=gpu_node, local_rank=local_rank,
+        local_world_size=local_world_size,
+    )
+    try:
+        os.sched_setaffinity(0, set(main_cpu_set))
+    except Exception as e:
+        print_rank_0(f"[AFFINITY] process setaffinity failed: {e}")
 
-    def _stat_to_dict_ms(st):
-        s2ms = 1000.0
+    print_rank_0(
+        f"[BIND] rank={rank} local_rank(gpu)={local_rank} gpu_numa_node={gpu_node} "
+        f"main_cpu_set={main_cpu_set} cpu_thread_set={cpu_thread_set} num_workers={num_workers}"
+    )
+    return main_cpu_set, cpu_thread_set
 
-        def q(p):
-            return (st.quantile_s(p) * s2ms) if hasattr(st, "quantile_s") else 0.0
 
-        # submodule_timing.Stat（warmup拡張版）に対応
+def _move_batch_to_device(batch, device, is_causal_lm, is_mlm):
+    """バッチを device に転送する。LM 系は dict、画像分類は (images, labels)。"""
+    if is_causal_lm or is_mlm:
         return {
-            "seen": getattr(st, "seen", st.count),     # warmup含む観測回数
-            "warmup_n": getattr(st, "warmup_n", 0),
-            "count": st.count,                         # warmup除外後のサンプル数
-
-            # ---- time: all in ms ----
-            "total_ms": st.total_s * s2ms,
-            "avg_ms": st.avg_s * s2ms,
-            "std_ms": getattr(st, "std_s", 0.0) * s2ms,
-            "cv": getattr(st, "cv", 0.0),              # 変動係数は無次元なのでそのまま
-
-            "min_ms": (st.min_s * s2ms if st.count else 0.0),
-            "p50_ms": q(0.50),
-            "p90_ms": q(0.90),
-            "p99_ms": q(0.99),
-            "max_ms": (st.max_s * s2ms if st.count else 0.0),
+            "input_ids": batch["input_ids"].to(device, non_blocking=True),
+            "attention_mask": batch["attention_mask"].to(device, non_blocking=True),
+            "labels": batch["labels"].to(device, non_blocking=True),
         }
+    images, labels = batch
+    return (images.to(device, non_blocking=True).half(),  # モデルは fp16
+            labels.to(device, non_blocking=True))
 
-    for mid in sorted(module_ids):
-        info = smt.get_module_info(mid) or {}
-        name = info.get("name") or ""
-        cls = info.get("class") or ""
-        mkey = f"id={mid} name='{name}' class='{cls}'"
 
-        out[mkey] = {ph: None for ph in phases}
+def _forward_loss(zero_model, loss_fn, inputs, is_causal_lm, is_mlm):
+    """forward を実行して float の loss を返す。"""
+    if is_causal_lm or is_mlm:
+        output = zero_model.forward(input_ids=inputs["input_ids"],
+                                    attention_mask=inputs["attention_mask"],
+                                    labels=inputs["labels"])
+        return output.loss.float()
+    images, labels = inputs
+    logits = zero_model.forward(images)
+    return loss_fn(logits.float(), labels)
 
-        for ph in phases:
-            st = stats.get((ph, mid))
-            if st is None:
+
+def _format_step_stats(label, vals_sec, warmup=0):
+    """統計情報を1行にフォーマット。warmup ステップを除外。"""
+    import numpy as np
+    a = np.array(vals_sec[warmup:]) * 1000.0  # ms
+    if len(a) == 0:
+        return None
+    return (f"{label:>10}: "
+            f"count={len(a):>4} (warmup={warmup}) | "
+            f"total={a.sum():.1f}ms  mean={a.mean():.2f}ms  std={a.std():.2f}ms | "
+            f"min={a.min():.2f}ms  p50={np.median(a):.2f}ms  "
+            f"p90={np.percentile(a,90):.2f}ms  p99={np.percentile(a,99):.2f}ms  "
+            f"max={a.max():.2f}ms")
+
+
+class StepTimeStats:
+    """ステップ単位の実行時間を記録・集計する。
+    全エポック通算で先頭 warmup_steps ステップ分は記録しない。"""
+
+    KEYS = ("fwd", "bwd", "opt", "opt_dpu", "step_total")
+
+    def __init__(self, warmup_steps):
+        self.warmup_steps = warmup_steps
+        self.epoch_times = {}       # key -> list of float (seconds), per-epoch
+        self.all_times = {}         # key -> list of float (seconds), across all epochs
+        self.global_step_count = 0  # 全エポック通算のステップカウンタ（ウォームアップ判定用）
+
+    def record(self, key, elapsed_sec):
+        if self.global_step_count < self.warmup_steps:
+            return
+        self.epoch_times.setdefault(key, []).append(elapsed_sec)
+
+    def finish_step(self):
+        self.global_step_count += 1
+
+    def start_epoch(self):
+        self.epoch_times = {}
+
+    def accumulate_epoch(self):
+        """エポックのデータを全エポック通算に蓄積（ウォームアップは記録時点で除外済み）。"""
+        for key, vals in self.epoch_times.items():
+            self.all_times.setdefault(key, []).extend(vals)
+
+    def print_epoch(self, epoch_num):
+        print(f"========== Per-Step Timing Statistics (Epoch {epoch_num}) ==========")
+        for key in self.KEYS:
+            vals = self.epoch_times.get(key)
+            if not vals:
                 continue
-            out[mkey][ph] = _stat_to_dict_ms(st)
+            line = _format_step_stats(f"[E{epoch_num}] {key}", vals, warmup=0)
+            if line:
+                print(line)
+        print("=" * 80)
 
-    return out
+    def print_all(self):
+        print(f"========== Per-Step Timing Statistics (All Epochs, global warmup={self.warmup_steps} excluded) ==========")
+        for key in self.KEYS:
+            vals = self.all_times.get(key)
+            if not vals:
+                continue
+            line = _format_step_stats(f"[All] {key}", vals, warmup=0)
+            if line:
+                print(line)
+        print("=" * 80)
+
+
+def _print_all_comm_stats():
+    """通信/転送の時間・回数・バイトはコード内計測を廃止し nsys に一本化した。"""
+    pass
+
+
+def _train_step_normal(zero_model, loss_fn, inputs, timers, stats,
+                       is_causal_lm, is_mlm):
+    """通常経路: fwd → bwd → 同期 Adam step (同一 step 内で反映)。"""
+    timers("fwd").start()
+    t0 = time.perf_counter()
+    loss = _forward_loss(zero_model, loss_fn, inputs, is_causal_lm, is_mlm)
+    timers("fwd").stop()
+    stats.record("fwd", time.perf_counter() - t0)
+
+    timers("bwd").start()
+    t0 = time.perf_counter()
+    zero_model.backward(loss)
+    timers("bwd").stop()
+    stats.record("bwd", time.perf_counter() - t0)
+
+    timers("opt").start()
+    t0 = time.perf_counter()
+    _step_push("step:opt")
+    try:
+        zero_model.step()
+    finally:
+        _step_pop()
+    timers("opt").stop()
+    stats.record("opt", time.perf_counter() - t0)
+
+
+def _train_step_dpu(zero_model, loss_fn, inputs, timers, stats,
+                    is_causal_lm, is_mlm):
+    """DPU 経路: 前 step の勾配で先に Adam step を発行し (delayed 1-step)、
+    fwd/bwd と並行実行。boundary で子プロセスの完了を待って fp32→fp16 を反映。"""
+    timers("opt_dpu").start()
+    t0 = time.perf_counter()
+    boundary_flag = zero_model.step_dpu()
+    timers("opt_dpu").stop()
+    stats.record("opt_dpu", time.perf_counter() - t0)
+
+    timers("fwd").start()
+    t0 = time.perf_counter()
+    loss = _forward_loss(zero_model, loss_fn, inputs, is_causal_lm, is_mlm)
+    timers("fwd").stop()
+    stats.record("fwd", time.perf_counter() - t0)
+
+    timers("bwd").start()
+    t0 = time.perf_counter()
+    zero_model.backward(loss)
+
+    if hasattr(zero_model, "optimizer") and hasattr(zero_model.optimizer, "_partition_all_parameters"):
+        zero_model.optimizer._partition_all_parameters()
+
+    timers("bwd").stop()
+    stats.record("bwd", time.perf_counter() - t0)
+
+    if boundary_flag:
+        _step_push("step:update_new_params")
+        try:
+            zero_model.optimizer.update_new_params()
+        finally:
+            _step_pop()
+
+
+@torch.no_grad()
+def _evaluate_testset(zero_model, test_loader, device, loss_fn, is_causal_lm, is_mlm):
+    """test_loader でテストセット全体を評価し (loss, accuracy) を返す。
+    ZeRO-3 では forward が param を all-gather する。no_grad 中は
+    _end_of_forward_hook が推論用 coordinator を各 forward 後に reset するため、
+    訓練用 coordinator の trace は壊れない。all_reduce(SUM) は test_loader が
+    rank 分割済みでも複製でも正しい平均を返す (分子分母とも同じ倍率で相殺)。
+
+    accuracy の定義:
+      画像分類     : サンプル単位の top-1 正答率。
+      causal LM    : 次トークン予測のトークン精度 (logits[:, :-1] を labels[:, 1:] と
+                     比較。labels==-100 の位置は無視)。loss/精度ともトークン重み平均。
+      MLM          : マスク位置のトークン精度 (labels!=-100 の位置のみ)。
+    """
+    zero_model.eval()
+    correct = 0.0
+    loss_sum = 0.0
+    total = 0.0
+    for batch in test_loader:
+        inputs = _move_batch_to_device(batch, device, is_causal_lm, is_mlm)
+        if is_causal_lm or is_mlm:
+            labels = inputs["labels"]
+            output = zero_model.forward(input_ids=inputs["input_ids"],
+                                        attention_mask=inputs["attention_mask"],
+                                        labels=labels)
+            logits = output.logits
+            if is_causal_lm:
+                # 次トークン予測: 位置 t の logit で t+1 を当てる
+                preds = logits[:, :-1, :].argmax(dim=-1)
+                tgt = labels[:, 1:]
+            else:  # MLM: マスク位置をその場で予測
+                preds = logits.argmax(dim=-1)
+                tgt = labels
+            mask = tgt != -100          # loss 無視インデックスを除外
+            n = float(mask.sum().item())
+            correct += (preds[mask] == tgt[mask]).sum().item()
+            loss_sum += output.loss.float().item() * n
+            total += n
+        else:
+            images, labels = inputs
+            logits = zero_model.forward(images)
+            loss = loss_fn(logits.float(), labels)
+            loss_sum += loss.item() * labels.size(0)
+            correct += (logits.argmax(dim=1) == labels).sum().item()
+            total += labels.size(0)
+    zero_model.train()
+    reduced = torch.tensor([loss_sum, float(correct), float(total)],
+                           dtype=torch.float64, device=device)
+    dist.all_reduce(reduced, op=dist.ReduceOp.SUM)
+    _loss, _correct, _total = reduced.tolist()
+    _total = max(1.0, _total)
+    return _loss / _total, _correct / _total
+
+
+def _build_lr_scheduler(optimizer, use_ema, lr_decay):
+    """--ema / --lr-decay 指定時に ExponentialLR を構築する (未指定なら None)。
+    長期学習向けの既定 gamma=0.95 (10 epoch で ×0.63 / 30 epoch で ×0.21 /
+    50 epoch で ×0.08)。DPU (遅延1step更新) の精度ダメージは lr に比例するため、
+    減衰が進み切替時点の lr が十分小さくなっていることが崩落回避に効く。
+    スケジュール計算は ExponentialLR (親プロセスの optimizer.param_groups) が行い、
+    実際に step する worker プロセスの Adam へは set_lr で毎エポック転送する。"""
+    if not use_ema and lr_decay == 1.0:
+        return None
+    _gamma = lr_decay if lr_decay != 1.0 else 0.95
+    lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=_gamma)
+    print_rank_0(f"[LR] ExponentialLR gamma={_gamma}")
+    # optimizer は設定キャリアで .step() は一度も呼ばれない (実更新は
+    # worker / GPU Adam)。param_groups は空なのでこの step() は no-op だが、
+    # scheduler の step カウンタが進み "lr_scheduler.step() before
+    # optimizer.step()" の UserWarning を抑止できる。
+    optimizer.step()
+    return lr_scheduler
+
 
 # ------------------------------------------------------------
 # 学習本体
@@ -402,7 +550,7 @@ def run_zero(use_profiler=False, use_bf16=False, use_ema=False,
              warmup_iters=None, measure_iters=None, seq_len=1024, num_epochs=None,
              reduce_bucket_size=int(1e8), prefetch_bucket_size=int(1e8),
              max_reuse_distance=0, max_live_parameters=int(1.5e8),
-             no_offload=False):
+             eval_accuracy=False, lr_decay=1.0, no_offload=False):
     profiler = None
     zero_model = None
     try:
@@ -410,24 +558,27 @@ def run_zero(use_profiler=False, use_bf16=False, use_ema=False,
         comm = MPI.COMM_WORLD
         warmup_cpuadam_once(comm, local_rank)
 
+        # 再現性テスト用: TEST_SEED があれば全 rank 同一シードで固定し、CUDA カーネルも
+        # 決定論化する (dataset の torch.randn / モデル初期化 / cuDNN・cublas を固定)。
+        # 大きいモデル (vit 等) の run 間ビット再現性を確保するためのもの。通常実行には無影響。
+        # cublas 決定論には CUBLAS_WORKSPACE_CONFIG=:4096:8 を環境変数で渡す必要がある。
+        _test_seed = os.environ.get("TEST_SEED")
+        if _test_seed is not None:
+            _s = int(_test_seed)
+            torch.manual_seed(_s)
+            torch.cuda.manual_seed_all(_s)
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+            # warn_only=True: 決定論実装が無い op は例外にせず警告のみ (落とさない)
+            torch.use_deterministic_algorithms(True, warn_only=True)
+
         device = torch.device(f"cuda:{local_rank}")
 
         # ------------------------
         # config
         # ------------------------
         num_workers = 0
-        #batch_size = 4
-        #num_workers = 0
-        #model_name = "tinynn"
-        #num_classes = 4
-        #input_size = 4
-        #num_train_samples = 16
-        #num_test_samples = 16
-        #epochs = 2
 
-        # Causal LM モデル判定
-        CAUSAL_LM_MODELS = {"opt-1.3b", "opt_1.3b", "llama-3b", "llama_3b", "llama-7b", "llama_7b", "llama-2-7b"}
-        MLM_MODELS = {"deberta-xl", "deberta_xl"}
         is_causal_lm = model_name.lower() in CAUSAL_LM_MODELS
         is_mlm = model_name.lower() in MLM_MODELS
 
@@ -448,9 +599,15 @@ def run_zero(use_profiler=False, use_bf16=False, use_ema=False,
             WARMUP_STEPS = int(os.environ.get("TIMING_WARMUP_STEPS", "5"))
             epochs = num_epochs if num_epochs is not None else 5
 
-        # ZeRO-Offload (既定): 全エポック DPU 経路 (CPU Adam worker + 遅延更新)。
-        # --no-offload (純粋 ZeRO-3): worker がないため通常経路 (zero_model.step()) を使う。
-        DPU_THRESHOLD = 10**9 if no_offload else -1
+        # ZeRO-Offload (既定): 全エポック DPU (delayed parameter update) 経路
+        # (CPU Adam worker + 遅延1step更新)。このエポック以下は正常経路、超えたら DPU 経路。
+        # テスト用に環境変数で上書き可能 (例: DPU_THRESHOLD=10**9 で全エポック通常経路)。
+        dpu_threshold = int(os.environ.get("DPU_THRESHOLD", "-1"))
+        if no_offload:
+            # 純粋 ZeRO-3 (GPU) モード: CPU Adam worker がないため DPU は使えない。
+            if "DPU_THRESHOLD" in os.environ:
+                print_rank_0("[WARN] --no-offload では DPU は無効です (DPU_THRESHOLD は無視)")
+            dpu_threshold = 10**9
         global_iter = 0
 
         print_rank_0(
@@ -460,91 +617,18 @@ def run_zero(use_profiler=False, use_bf16=False, use_ema=False,
             f"mode={'zero3-gpu (no-offload)' if no_offload else 'zero-offload (cpu)'}"
         )
 
-        # ----------------------------------------------------------
         # rank -> GPU -> NUMA node binding (cpu set 分割)
-        # ----------------------------------------------------------
-        gpu_node = get_gpu_numa_node(local_rank)
-        allowed_cpus = get_allowed_cpus()
-        CPU_THREAD_CORES = int(os.environ.get("CPU_THREAD_CORES", "2"))
-        local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE",
-                               os.environ.get("OMPI_COMM_WORLD_LOCAL_SIZE", "1")))
-        main_cpu_set, cpu_thread_set = choose_rank_cpu_sets(
-            rank=rank, world_size=world_size, allowed_cpus=allowed_cpus,
-            cpu_thread_cores=CPU_THREAD_CORES,
-            gpu_numa_node=gpu_node, local_rank=local_rank,
-            local_world_size=local_world_size,
-        )
-        try:
-            os.sched_setaffinity(0, set(main_cpu_set))
-        except Exception as e:
-            print_rank_0(f"[AFFINITY] process setaffinity failed: {e}")
-
-        # DataLoader worker 数を main_cpu_set に合わせて制限
-        # (main_cpu_set が 3 コアなら、worker=2 程度が妥当)
-        #num_workers = max(0, min(num_workers, max(0, len(main_cpu_set) - 1)))
-        print_rank_0(
-            f"[BIND] rank={rank} local_rank(gpu)={local_rank} gpu_numa_node={gpu_node} "
-            f"main_cpu_set={main_cpu_set} cpu_thread_set={cpu_thread_set} num_workers={num_workers}"
-        )
+        main_cpu_set, cpu_thread_set = _bind_cpu_sets(
+            rank, world_size, local_rank, num_workers)
 
         # ------------------------
         # dataset
         # ------------------------
-        if model_name.lower() == "tinynn":
-            # TinyNN用ダミーデータ (input=4, num_classes=4)
-            num_train_samples = 256
-            num_test_samples = 64
-            train_dataset = TensorDataset(
-                torch.randn(num_train_samples, 4),
-                torch.randint(0, 4, (num_train_samples,)),
-            )
-            test_dataset = TensorDataset(
-                torch.randn(num_test_samples, 4),
-                torch.randint(0, 4, (num_test_samples,)),
-            )
-        elif is_causal_lm:
-            from common.text_dataset import get_causal_lm_datasets
-            train_dataset, test_dataset, _tokenizer = get_causal_lm_datasets(
-                dataset_name=dataset_name,
-                model_name=model_name,
-                seq_len=seq_len,
-            )
-        elif is_mlm:
-            from common.text_dataset import get_mlm_datasets
-            train_dataset, test_dataset, _tokenizer = get_mlm_datasets(
-                dataset_name=dataset_name,
-                model_name=model_name,
-                seq_len=seq_len,
-            )
-        else:
-            train_dataset, test_dataset = get_datasets(
-                dataset_name,
-                batch_size,
-                num_workers,
-                resize_to_imagenet=True, #ViT用
-                #resize_to_imagenet=False, #ResNet用
-            )
-
-        train_sampler = DistributedSampler(
-            train_dataset, num_replicas=world_size, rank=rank, shuffle=True
-        )
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=batch_size,
-            sampler=train_sampler,
-            num_workers=num_workers,
-            pin_memory=True,
-            persistent_workers=(num_workers > 0),
-            drop_last=True,
-        )
-        test_loader = DataLoader(
-            test_dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=True,
-            persistent_workers=(num_workers > 0),
-        )
+        train_dataset, test_dataset = _build_datasets(
+            model_name, dataset_name, batch_size, num_workers, seq_len,
+            is_causal_lm, is_mlm)
+        train_sampler, train_loader, test_loader = _build_data_loaders(
+            train_dataset, test_dataset, batch_size, num_workers, rank, world_size)
 
         # ------------------------
         # model
@@ -555,26 +639,8 @@ def run_zero(use_profiler=False, use_bf16=False, use_ema=False,
         model_parameters = model.parameters()
         #通常だとmodelがbfloat16で登録されるとAdamもbf16で登録される。
         #しかし、ZeROの実装ではoptimizerをfp32で登録しなおすのでこのままの実装でおけ
-        optimizer = DeepSpeedCPUAdam(model_parameters, lr=3e-4, eps=1e-5)
+        optimizer = DeepSpeedCPUAdam(model_parameters, lr=1e-4, eps=1e-5)
         loss_fn = nn.CrossEntropyLoss()
-        
-        # -------------------------
-        # デバッグ用にモデルを出力
-        # -------------------------
-        #def is_rank0() -> bool:
-        #    return (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0
-
-        #@torch.no_grad()
-        #def print_all_params_rank0(model: torch.nn.Module):
-        #    if not is_rank0():
-        #        return
-        #    for name, p in model.named_parameters():
-        #        t = p.detach()
-        #        print(f"=== {name} | shape={tuple(t.shape)} dtype={t.dtype} device={t.device} ===")
-        #        print(t)  # ← ここで全要素をそのまま出力
-        #        print()
-                
-        #print_all_params_rank0(model)
 
         # ユーザ実装の ZeRO ラッパ（Stage 3 を想定）
         zero_model = ZeroWrapperExample(
@@ -592,151 +658,18 @@ def run_zero(use_profiler=False, use_bf16=False, use_ema=False,
         timers = SynchronizedWallClockTimer()
         timers("opt_dpu")
 
-        throughput_every = 10000
         timer_every = 10000
         since_last_timer = 0
-
-        try:
-            throughput_meter = ThroughputMeter(
-                warmup_steps=5,
-                steps_per_output=throughput_every,
-                device=device,
-                model=model,
-            )
-        except TypeError:
-            throughput_meter = ThroughputMeter(
-                warmup_steps=5,
-                steps_per_output=throughput_every,
-            )
-        throughput_meter.start()
 
         if use_profiler:
             log_dir = f"./profiler_log/rank_{rank}"
             os.makedirs(log_dir, exist_ok=True)
             profiler = start_profiler(log_dir=log_dir, use_cuda=True)
 
+        stats = StepTimeStats(WARMUP_STEPS)
         loss_history, accuracy_history = [], []
-        
-        # ------------------------------------------------------------
-        # Communication/Transfer stats (epoch delta, no reset)
-        # ------------------------------------------------------------
-        import zero_optimizer as _zo
-        import partition_parameters as _pp
 
-        def _get_float(fn, default=0.0):
-            try:
-                return float(fn())
-            except Exception:
-                return float(default)
-
-        # prev cumulative (process lifetime)
-        prev_rs_ms = _get_float(_zo.get_reduce_scatter_time_ms, 0.0)
-        prev_rs_calls = _get_float(_zo.get_reduce_scatter_calls, 0.0)
-        prev_ag_calls = _get_float(_pp.get_all_gather_calls, 0.0)
-        prev_fp_calls = _get_float(_pp.get_full_parameter_calls, 0.0)
-
-        get_ag_dpu_ms = getattr(_pp, "get_all_gather_dpu_ms", None)
-        get_ag_block_ms = getattr(_pp, "get_all_gather_block_ms", None)
-        get_ag_bytes = getattr(_pp, "get_all_gather_bytes", None)
-        get_fp_copy_ms = getattr(_pp, "get_full_parameter_copy_ms", None)
-        get_fp_bytes = getattr(_pp, "get_full_parameter_bytes", None)
-        prev_ag_dpu_ms = _get_float(get_ag_dpu_ms, 0.0) if get_ag_dpu_ms else 0.0
-        prev_ag_block_ms = _get_float(get_ag_block_ms, 0.0) if get_ag_block_ms else 0.0
-        prev_ag_bytes = 0
-        prev_fp_bytes = 0
-        prev_fp_copy_ms = 0.0
-
-        get_grad_d2h_ms = getattr(_zo, "get_grad_offload_d2h_time_ms", None)
-        get_grad_d2h_calls = getattr(_zo, "get_grad_offload_d2h_calls", None)
-        get_param_h2d_ms = getattr(_pp, "get_param_shard_h2d_time_ms", None)
-        get_param_h2d_calls = getattr(_pp, "get_param_shard_h2d_calls", None)
-
-        prev_grad_d2h_ms = _get_float(get_grad_d2h_ms, 0.0) if get_grad_d2h_ms else 0.0
-        prev_grad_d2h_calls = _get_float(get_grad_d2h_calls, 0.0) if get_grad_d2h_calls else 0.0
-        prev_param_h2d_ms = _get_float(get_param_h2d_ms, 0.0) if get_param_h2d_ms else 0.0
-        prev_param_h2d_calls = _get_float(get_param_h2d_calls, 0.0) if get_param_h2d_calls else 0.0
-        
-        # ステップ単位の時間を記録
-        step_times = {}       # key -> list of float (seconds), per-epoch
-        all_step_times = {}   # key -> list of float (seconds), across all epochs
-        global_step_count = 0  # 全エポック通算のステップカウンタ（ウォームアップ判定用）
-
-        def _record_step_time(key, elapsed_sec):
-            # ウォームアップ中（global_step_count < WARMUP_STEPS）は記録しない
-            if global_step_count < WARMUP_STEPS:
-                return
-            if key not in step_times:
-                step_times[key] = []
-            step_times[key].append(elapsed_sec)
-
-        def _format_stats(label, vals_sec, warmup=0):
-            """統計情報を1行にフォーマット。warmup ステップを除外。"""
-            import numpy as np
-            a = np.array(vals_sec[warmup:]) * 1000.0  # ms
-            if len(a) == 0:
-                return None
-            return (f"{label:>10}: "
-                    f"count={len(a):>4} (warmup={warmup}) | "
-                    f"total={a.sum():.1f}ms  mean={a.mean():.2f}ms  std={a.std():.2f}ms | "
-                    f"min={a.min():.2f}ms  p50={np.median(a):.2f}ms  "
-                    f"p90={np.percentile(a,90):.2f}ms  p99={np.percentile(a,99):.2f}ms  "
-                    f"max={a.max():.2f}ms")
-
-        def _print_step_stats(epoch_num):
-            """エポック単位の統計情報を出力する（ウォームアップはグローバルで1回のみ除外済み）。"""
-            print(f"========== Per-Step Timing Statistics (Epoch {epoch_num}) ==========")
-            for key in ["fwd", "bwd", "opt", "opt_dpu", "step_total"]:
-                vals = step_times.get(key)
-                if not vals:
-                    continue
-                line = _format_stats(f"[E{epoch_num}] {key}", vals, warmup=0)
-                if line:
-                    print(line)
-            print("=" * 80)
-
-        def _print_all_epochs_stats():
-            """全エポック通算の統計情報を出力する。"""
-            print(f"========== Per-Step Timing Statistics (All Epochs, global warmup={WARMUP_STEPS} excluded) ==========")
-            for key in ["fwd", "bwd", "opt", "opt_dpu", "step_total"]:
-                vals = all_step_times.get(key)
-                if not vals:
-                    continue
-                line = _format_stats(f"[All] {key}", vals, warmup=0)
-                if line:
-                    print(line)
-            print("=" * 80)
-
-        def _print_all_comm_stats():
-            """全エポック通算の通信統計を出力する。"""
-            try:
-                tot_rs_ms = _get_float(_zo.get_reduce_scatter_time_ms, 0.0)
-                tot_rs_calls = int(_get_float(_zo.get_reduce_scatter_calls, 0.0))
-                tot_ag_calls = int(_get_float(_pp.get_all_gather_calls, 0.0))
-                tot_fp_calls = int(_get_float(_pp.get_full_parameter_calls, 0.0))
-                tot_ag_dpu_ms = _get_float(get_ag_dpu_ms, 0.0) if get_ag_dpu_ms else 0.0
-                tot_ag_block_ms = _get_float(get_ag_block_ms, 0.0) if get_ag_block_ms else 0.0
-                tot_fp_copy_ms = _get_float(get_fp_copy_ms, 0.0) if get_fp_copy_ms else 0.0
-                tot_grad_d2h_ms = _get_float(get_grad_d2h_ms, 0.0) if get_grad_d2h_ms else 0.0
-                tot_grad_d2h_calls = int(_get_float(get_grad_d2h_calls, 0.0)) if get_grad_d2h_calls else 0
-                tot_param_h2d_ms = _get_float(get_param_h2d_ms, 0.0) if get_param_h2d_ms else 0.0
-                tot_param_h2d_calls = int(_get_float(get_param_h2d_calls, 0.0)) if get_param_h2d_calls else 0
-                _get_ag_bytes = getattr(_pp, "get_all_gather_bytes", None)
-                _get_fp_bytes = getattr(_pp, "get_full_parameter_bytes", None)
-                tot_ag_bytes = _get_float(_get_ag_bytes, 0) if _get_ag_bytes else 0
-                tot_fp_bytes = _get_float(_get_fp_bytes, 0) if _get_fp_bytes else 0
-
-                print("========== ZeRO-3 Communication / Transfer (All Epochs total) ==========")
-                print(f"[All] reduce_scatter:    {tot_rs_ms/1000.0:.6f}s, calls={tot_rs_calls}")
-                print(f"[All] all_gather (NCCL): calls={tot_ag_calls}, {tot_ag_bytes/1e9:.3f}GB")
-                print(f"[All]   AG 通信処理:     {tot_ag_dpu_ms/1000.0:.6f}s")
-                print(f"[All]   AG block:        {tot_ag_block_ms/1000.0:.6f}s")
-                print(f"[All] full param (CPU→GPU): calls={tot_fp_calls}, {tot_fp_bytes/1e9:.3f}GB")
-                print(f"[All]   FP コピー:       {tot_fp_copy_ms/1000.0:.6f}s")
-                print(f"[All] grad D2H:          {tot_grad_d2h_ms/1000.0:.6f}s, calls={tot_grad_d2h_calls}")
-                print(f"[All] param H2D:         {tot_param_h2d_ms/1000.0:.6f}s, calls={tot_param_h2d_calls}")
-                print("=" * 80)
-            except Exception:
-                pass
+        lr_scheduler = _build_lr_scheduler(optimizer, use_ema, lr_decay)
 
         # ------------------------
         # Training loop
@@ -754,27 +687,28 @@ def run_zero(use_profiler=False, use_bf16=False, use_ema=False,
         for epoch in range(epochs):
             train_sampler.set_epoch(epoch)
             zero_model.train()
+            use_dpu = epoch > dpu_threshold
             if _stall_tracker is not None:
                 _stall_tracker.set_epoch(epoch)
+
+            if lr_scheduler is not None:
+                _lr_e = optimizer.param_groups[0]["lr"]
+                if hasattr(zero_model.optimizer, "set_lr"):
+                    zero_model.optimizer.set_lr(_lr_e)
+                else:
+                    print_rank_0("[LR][WARN] optimizer に set_lr がないため "
+                                 "worker への lr 反映はスキップ")
+                print_rank_0(f"[LR] epoch {epoch+1}: lr={_lr_e:.3e}")
 
             total_steps = len(train_loader)
             next_report = 0.1
             start_t = time.time()
-            step_times.clear()
+            stats.start_epoch()
 
             ctx = profiler if profiler else contextlib.nullcontext()
             with ctx as prof:
                 for step, batch in enumerate(train_loader, 1):
-                    if is_causal_lm or is_mlm:
-                        input_ids = batch["input_ids"].to(device, non_blocking=True)
-                        attention_mask = batch["attention_mask"].to(device, non_blocking=True)
-                        lm_labels = batch["labels"].to(device, non_blocking=True)
-                        bsz = input_ids.size(0)
-                    else:
-                        images, labels = batch
-                        images = images.to(device, non_blocking=True).half()
-                        labels = labels.to(device, non_blocking=True)
-                        bsz = labels.size(0)
+                    inputs = _move_batch_to_device(batch, device, is_causal_lm, is_mlm)
 
                     step_t0 = time.perf_counter()
 
@@ -800,89 +734,19 @@ def run_zero(use_profiler=False, use_bf16=False, use_ema=False,
                     from common import debug_params as dbg
                     dbg.set_step(step + epoch * total_steps)
 
-                    if epoch <= DPU_THRESHOLD:
-                        # ----------------------------------------------------------
-                        # ★重要：通常側でも zero_grad を明示（ラッパ依存を排除）
-                        # ----------------------------------------------------------
-                        optimizer.zero_grad(set_to_none=True)
-
-                        _pp.set_ag_phase("forward")
-                        timers("fwd").start()
-                        t0 = time.perf_counter()
-                        with throughput_meter(batch_size=bsz):
-                            if is_causal_lm or is_mlm:
-                                output = zero_model.forward(input_ids=input_ids, attention_mask=attention_mask, labels=lm_labels)
-                                loss = output.loss.float()
-                            else:
-                                logits = zero_model.forward(images)
-                                loss = loss_fn(logits.float(), labels)
-                        timers("fwd").stop()
-                        _record_step_time("fwd", time.perf_counter() - t0)
-
-                        _pp.set_ag_phase("backward")
-                        timers("bwd").start()
-                        t0 = time.perf_counter()
-                        zero_model.backward(loss)
-                        timers("bwd").stop()
-                        _record_step_time("bwd", time.perf_counter() - t0)
-                        _pp.set_ag_phase("unknown")
-
-                        timers("opt").start()
-                        t0 = time.perf_counter()
-                        _step_push("step:opt")
-                        try:
-                            zero_model.step()
-                        finally:
-                            _step_pop()
-                        timers("opt").stop()
-                        _record_step_time("opt", time.perf_counter() - t0)
-
-                    # ----------------------
-                    # DPU オフロード版 (CPU Adam は別プロセスで実行)
-                    # ----------------------
+                    # 注: ここで optimizer.zero_grad は呼ばない。run_zero.py の optimizer
+                    # (DeepSpeedCPUAdam) は param_groups が空にされる設定キャリアで no-op。
+                    # 実際の勾配クリアは wrapper 内 _take_model_step(_dpu) が呼ぶ
+                    # ZeroOptimizer3.zero_grad (fp16 param の .grad=None 化) が行う。
+                    if use_dpu:
+                        _train_step_dpu(zero_model, loss_fn, inputs, timers, stats,
+                                        is_causal_lm, is_mlm)
                     else:
-                        optimizer.zero_grad(set_to_none=True)
+                        _train_step_normal(zero_model, loss_fn, inputs, timers, stats,
+                                           is_causal_lm, is_mlm)
 
-                        timers("opt_dpu").start()
-                        t0 = time.perf_counter()
-                        boundary_flag = zero_model.step_dpu()
-                        timers("opt_dpu").stop()
-                        _record_step_time("opt_dpu", time.perf_counter() - t0)
-
-                        _pp.set_ag_phase("forward")
-                        timers("fwd").start()
-                        t0 = time.perf_counter()
-                        with throughput_meter(batch_size=bsz):
-                            if is_causal_lm or is_mlm:
-                                output = zero_model.forward(input_ids=input_ids, attention_mask=attention_mask, labels=lm_labels)
-                                loss = output.loss.float()
-                            else:
-                                logits = zero_model.forward(images)
-                                loss = loss_fn(logits.float(), labels)
-                        timers("fwd").stop()
-                        _record_step_time("fwd", time.perf_counter() - t0)
-
-                        _pp.set_ag_phase("backward")
-                        timers("bwd").start()
-                        t0 = time.perf_counter()
-                        zero_model.backward(loss)
-
-                        if hasattr(zero_model, "optimizer") and hasattr(zero_model.optimizer, "_partition_all_parameters"):
-                            zero_model.optimizer._partition_all_parameters()
-
-                        timers("bwd").stop()
-                        _record_step_time("bwd", time.perf_counter() - t0)
-                        _pp.set_ag_phase("unknown")
-
-                        if boundary_flag:
-                            _step_push("step:update_new_params")
-                            try:
-                                zero_model.optimizer.update_new_params()
-                            finally:
-                                _step_pop()
-
-                    _record_step_time("step_total", time.perf_counter() - step_t0)
-                    global_step_count += 1
+                    stats.record("step_total", time.perf_counter() - step_t0)
+                    stats.finish_step()
 
                     # イテレーションベースの計測制御
                     global_iter += 1
@@ -890,6 +754,19 @@ def run_zero(use_profiler=False, use_bf16=False, use_ema=False,
                     # NSYS_PROFILE_MEASURE_ITERS で早めに切って末尾の hang を回避できる
                     if total_target_iters is not None and global_iter == _nsys_profile_end_iter:
                         torch.cuda.synchronize()
+                        # nsys 版は capture-range-end=stop-shutdown でこの直後にプロセスが
+                        # kill され、エポック末の集計ログに到達しない。MEASURE_HOST_XFER=1 の
+                        # ときは、ここ (計測区間終了時) で通常ログ相当の集計を出力しておく。
+                        if rank == 0 and os.environ.get("MEASURE_HOST_XFER", "0") == "1":
+                            print(f"[Epoch {epoch+1}/{epochs}] | train time: {time.time() - start_t:.2f}s "
+                                  f"(nsys measure cutoff @ iter {global_iter})")
+                            stats.print_epoch(epoch + 1)
+                            try:
+                                torch.cuda.synchronize()
+                            except Exception:
+                                pass
+                            _print_all_comm_stats()
+                            sys.stdout.flush()
                         dist.barrier()  # キャプチャ窓の終端も揃える (start 側と対)
                         torch.cuda.profiler.stop()
                     if total_target_iters is not None and global_iter >= total_target_iters:
@@ -899,9 +776,9 @@ def run_zero(use_profiler=False, use_bf16=False, use_ema=False,
                     if profiler:
                         prof.step()
 
-                    if getattr(throughput_meter, "_warmup_done", False):
+                    if stats.global_step_count >= WARMUP_STEPS:
                         if since_last_timer % timer_every == 0:
-                            timer_names = ["fwd", "bwd", "opt"] if epoch <= DPU_THRESHOLD else ["fwd", "bwd", "opt_dpu"]
+                            timer_names = ["fwd", "bwd", "opt_dpu"] if use_dpu else ["fwd", "bwd", "opt"]
                             timers.log(
                                 names=timer_names,
                                 normalizer=max(1, float(timer_every)),
@@ -920,108 +797,32 @@ def run_zero(use_profiler=False, use_bf16=False, use_ema=False,
                         )
                         next_report += 0.1
 
+            # ---- 各エポック終了後にテストセットで評価し accuracy_history に記録 ----
+            # --eval-accuracy 指定時のみ。全 rank が collective forward + all_reduce に
+            # 参加するため if rank==0 の外で呼ぶ。
+            if eval_accuracy:
+                test_loss, test_acc = _evaluate_testset(
+                    zero_model, test_loader, device, loss_fn, is_causal_lm, is_mlm)
+                loss_history.append(test_loss)
+                accuracy_history.append(test_acc)
+                print_rank_0(f"[Epoch {epoch+1}/{epochs}] test_loss={test_loss:.4f} "
+                             f"test_acc={test_acc:.4f}")
+
             if rank == 0:
                 print(f"[Epoch {epoch+1}/{epochs}] | train time: {time.time() - start_t:.2f}s")
-                _print_step_stats(epoch + 1)
+                stats.print_epoch(epoch + 1)
+                stats.accumulate_epoch()
 
-                # ウォームアップ除外後のデータを全エポック通算に蓄積
-                for key, vals in step_times.items():
-                    if key not in all_step_times:
-                        all_step_times[key] = []
-                    all_step_times[key].extend(vals)
-
-            # ------------------------------------------------------------
-            # Communication / Transfer time (epoch delta, no reset)
-            # ------------------------------------------------------------
-            if rank == 0:
-                # ensure kernels done before reading stats
-                try:
-                    torch.cuda.synchronize()
-                except Exception:
-                    pass
-
-                cur_rs_ms = _get_float(_zo.get_reduce_scatter_time_ms, 0.0)
-                cur_rs_calls = _get_float(_zo.get_reduce_scatter_calls, 0.0)
-                cur_ag_calls = _get_float(_pp.get_all_gather_calls, 0.0)
-                cur_fp_calls = _get_float(_pp.get_full_parameter_calls, 0.0)
-
-                cur_grad_d2h_ms = _get_float(get_grad_d2h_ms, 0.0) if get_grad_d2h_ms else 0.0
-                cur_grad_d2h_calls = _get_float(get_grad_d2h_calls, 0.0) if get_grad_d2h_calls else 0.0
-                cur_param_h2d_ms = _get_float(get_param_h2d_ms, 0.0) if get_param_h2d_ms else 0.0
-                cur_param_h2d_calls = _get_float(get_param_h2d_calls, 0.0) if get_param_h2d_calls else 0.0
-
-                cur_ag_dpu_ms = _get_float(get_ag_dpu_ms, 0.0) if get_ag_dpu_ms else 0.0
-                cur_ag_block_ms = _get_float(get_ag_block_ms, 0.0) if get_ag_block_ms else 0.0
-
-                cur_fp_copy_ms = _get_float(get_fp_copy_ms, 0.0) if get_fp_copy_ms else 0.0
-                cur_ag_bytes = _get_float(get_ag_bytes, 0) if get_ag_bytes else 0
-                cur_fp_bytes = _get_float(get_fp_bytes, 0) if get_fp_bytes else 0
-
-                # epoch deltas
-                epoch_rs_ms = max(0.0, cur_rs_ms - prev_rs_ms)
-                epoch_rs_calls = max(0.0, cur_rs_calls - prev_rs_calls)
-                epoch_ag_calls = max(0.0, cur_ag_calls - prev_ag_calls)
-                epoch_fp_calls = max(0.0, cur_fp_calls - prev_fp_calls)
-
-                epoch_grad_d2h_ms = max(0.0, cur_grad_d2h_ms - prev_grad_d2h_ms)
-                epoch_grad_d2h_calls = max(0.0, cur_grad_d2h_calls - prev_grad_d2h_calls)
-                epoch_param_h2d_ms = max(0.0, cur_param_h2d_ms - prev_param_h2d_ms)
-                epoch_param_h2d_calls = max(0.0, cur_param_h2d_calls - prev_param_h2d_calls)
-
-                epoch_ag_dpu_ms = max(0.0, cur_ag_dpu_ms - prev_ag_dpu_ms)
-                epoch_ag_block_ms = max(0.0, cur_ag_block_ms - prev_ag_block_ms)
-                epoch_ag_bytes = max(0, cur_ag_bytes - prev_ag_bytes)
-                epoch_fp_bytes = max(0, cur_fp_bytes - prev_fp_bytes)
-                epoch_fp_copy_ms = max(0.0, cur_fp_copy_ms - prev_fp_copy_ms)
-
-                print("========== ZeRO-3 Communication / Transfer (epoch delta) ==========")
-                print(f"[Epoch {epoch+1}] reduce_scatter:    {epoch_rs_ms/1000.0:.6f}s, calls={int(epoch_rs_calls)}")
-                print(f"[Epoch {epoch+1}] all_gather (NCCL): calls={int(epoch_ag_calls)}, {epoch_ag_bytes/1e9:.3f}GB")
-                print(f"[Epoch {epoch+1}]   AG 通信処理:     {epoch_ag_dpu_ms/1000.0:.6f}s")
-                print(f"[Epoch {epoch+1}]   AG block:        {epoch_ag_block_ms/1000.0:.6f}s")
-                print(f"[Epoch {epoch+1}] full param (CPU→GPU): calls={int(epoch_fp_calls)}, {epoch_fp_bytes/1e9:.3f}GB")
-                print(f"[Epoch {epoch+1}]   FP コピー:       {epoch_fp_copy_ms/1000.0:.6f}s")
-                print(f"[Epoch {epoch+1}] grad D2H:          {epoch_grad_d2h_ms/1000.0:.6f}s, calls={int(epoch_grad_d2h_calls)}")
-                print(f"[Epoch {epoch+1}] param H2D:         {epoch_param_h2d_ms/1000.0:.6f}s, calls={int(epoch_param_h2d_calls)}")
-                print("===================================================================")
-
-                # Per-AG detailed analysis
-                try:
-                    _pp.print_ag_analysis(epoch + 1)
-                    _pp.reset_ag_records()
-                except Exception:
-                    pass
-
-                # Forward/Backward AG block breakdown
-                try:
-                    ps = _pp.get_ag_phase_stats()
-                    print(f"========== AG Block by Phase (Epoch {epoch+1}) ==========")
-                    print(f"  Forward:  block={ps['fwd_block_ms']/1000:.3f}s  calls={ps['fwd_calls']}"
-                          f"  avg={ps['fwd_block_ms']/max(1,ps['fwd_calls']):.3f}ms/call")
-                    print(f"  Backward: block={ps['bwd_block_ms']/1000:.3f}s  calls={ps['bwd_calls']}"
-                          f"  avg={ps['bwd_block_ms']/max(1,ps['bwd_calls']):.3f}ms/call")
-                    print(f"{'=' * 55}")
-                    _pp.reset_ag_phase_stats()
-                except Exception:
-                    pass
-
-                # update prev for next epoch
-                prev_rs_ms = cur_rs_ms
-                prev_rs_calls, prev_ag_calls, prev_fp_calls = cur_rs_calls, cur_ag_calls, cur_fp_calls
-                prev_grad_d2h_ms, prev_grad_d2h_calls = cur_grad_d2h_ms, cur_grad_d2h_calls
-                prev_param_h2d_ms, prev_param_h2d_calls = cur_param_h2d_ms, cur_param_h2d_calls
-                prev_ag_dpu_ms, prev_ag_block_ms = cur_ag_dpu_ms, cur_ag_block_ms
-                prev_ag_bytes, prev_fp_bytes = cur_ag_bytes, cur_fp_bytes
-                prev_fp_copy_ms = cur_fp_copy_ms
+            if lr_scheduler is not None:
+                lr_scheduler.step()
 
             # イテレーションベースの計測: エポックループもbreak
             if total_target_iters is not None and global_iter >= total_target_iters:
                 break
 
         if rank == 0:
-            _print_all_epochs_stats()
+            stats.print_all()
             _print_all_comm_stats()
-            throughput_meter.summary()
 
             try:
                 print(memory_usage_rank(model, optimizer=optimizer))
@@ -1029,90 +830,10 @@ def run_zero(use_profiler=False, use_bf16=False, use_ema=False,
                 pass
             print("Loss history:", loss_history)
             print("Accuracy history:", accuracy_history)
-            
-            '''
-            summary = summarize_by_submodule()
 
-            # 見やすさのため、fwd_exec の total が大きい順に並べる（無い場合は 0）
-            def _get_total(v, phase):
-                d = v.get(phase)
-                return float(d["total_ms"]) if d else 0.0
-
-            items = list(summary.items())
-            items.sort(key=lambda kv: _get_total(kv[1], "fwd_exec"), reverse=True)
-
-            def _fmt_phase(ph_name, d):
-                if d is None:
-                    return f"  {ph_name:<8}: (no data)"
-                return (
-                    f"  {ph_name:<8}: "
-                    f"seen={d['seen']:>4} wup={d['warmup_n']:>2} count={d['count']:>4} | "
-                    f"total={d['total_ms']:.3f}ms mean={d['avg_ms']:.3f}ms "
-                    f"std={d['std_ms']:.3f}ms cv={d['cv']:.3f} | "
-                    f"min={d['min_ms']:.3f}ms p50={d['p50_ms']:.3f}ms "
-                    f"p90={d['p90_ms']:.3f}ms p99={d['p99_ms']:.3f}ms max={d['max_ms']:.3f}ms"
-                )
-
-            for mkey, v in items:
-                print("module:", mkey)
-                print(_fmt_phase("fwd_fetch",      v.get("fwd_fetch")))
-                print(_fmt_phase("fwd_wait_stall", v.get("fwd_wait_stall")))
-                print(_fmt_phase("fwd_exec",       v.get("fwd_exec")))
-                print(_fmt_phase("bwd_fetch",      v.get("bwd_fetch")))
-                print(_fmt_phase("bwd_wait_stall", v.get("bwd_wait_stall")))
-                print(_fmt_phase("bwd_exec",       v.get("bwd_exec")))
-
-            # ---- pure_exec サマリ (子孫の wait_stall を差し引いた純粋カーネル時間) ----
-            # 葉モジュール: pure_exec == exec (純粋カーネル時間そのもの)
-            # 親モジュール: pure_exec == subtree 内の純粋カーネル時間総和
-            try:
-                smt.pretty_print_pure_exec(
-                    exec_phase="bwd_exec",
-                    stall_phase="bwd_wait_stall",
-                    sort_by="exec_total_s",
-                )
-                smt.pretty_print_pure_exec(
-                    exec_phase="fwd_exec",
-                    stall_phase="fwd_wait_stall",
-                    sort_by="exec_total_s",
-                )
-            except Exception as _e:
-                print(f"[warn] pretty_print_pure_exec failed: {_e}")
-
-            # ---- Phase 20: AG/RS stall event-bracket dump ----
-            if _stall_tracker is not None:
-                try:
-                    label = os.environ.get("AG_STALL_LABEL", "stall_events")
-                    out_path = os.environ.get(
-                        "AG_STALL_DUMP_PATH",
-                        f"logs/{label}_rank{rank}.json")
-                    extra = {
-                        "rank": rank,
-                        "world_size": world_size,
-                        "config": "cpu_buffering",
-                        "model": model_name,
-                        "warmup_iters": int(WARMUP_STEPS),
-                        "total_target_iters": int(total_target_iters) if total_target_iters else None,
-                        "disable_completion_poller": os.environ.get(
-                            "DISABLE_COMPLETION_POLLER", "0"),
-                    }
-                    _stall_tracker.dump_json(out_path, extra=extra)
-                    print(f"[Phase 20] AG/RS stall events dumped to {out_path}")
-                    summ = _stall_tracker.summary()
-                    if summ:
-                        print("========== Phase 20: AG/RS stall summary (event-bracket) ==========")
-                        for k in sorted(summ.keys()):
-                            v = summ[k]
-                            print(f"  {k:<24} count={int(v['count']):>5} "
-                                  f"total={v['total_ms']:>9.1f}ms "
-                                  f"mean={v['mean_ms']:>7.3f}ms "
-                                  f"p50={v['p50_ms']:>7.3f}ms "
-                                  f"p95={v['p95_ms']:>7.3f}ms "
-                                  f"max={v['max_ms']:>7.3f}ms")
-                        print("=" * 70)
-                except Exception as _e:
-                    print(f"[warn] Phase 20 stall dump failed: {_e}")
-            '''
+        _dump_path = os.environ.get("DUMP_FINAL_PARAMS")
+        if _dump_path:
+            dump_final_params(model, rank, _dump_path)
 
     finally:
         if profiler and hasattr(profiler, "stop"):
@@ -1131,7 +852,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--profiler", action="store_true")
     parser.add_argument("--bf16", action="store_true", help="Enable bfloat16 autocast (default: fp32)")
-    parser.add_argument("--ema", action="store_true")
+    parser.add_argument("--ema", action="store_true",
+                        help="PyTorch 標準 ExponentialLR による学習率スケジュールを有効化 "
+                             "(長期学習向け既定: gamma=0.95)")
     parser.add_argument("--model", type=str, default="vit_l_16",
                         help="Model name (vit_l_16, opt-1.3b, llama-7b, etc.)")
     parser.add_argument("--dataset", type=str, default="cifar10",
@@ -1151,8 +874,15 @@ def main():
     parser.add_argument("--prefetch-bucket-size", type=float, default=1e8)
     parser.add_argument("--max-reuse-distance", type=float, default=0)
     parser.add_argument("--max-live-parameters", type=float, default=1.5e8)
+    parser.add_argument("--eval-accuracy", action="store_true",
+                        help="各エポック後に test_loader で accuracy を評価する "
+                             "(画像=分類精度 / テキスト=トークン精度)。既定は無効。")
+    parser.add_argument("--lr-decay", type=float, default=1.0,
+                        help="ExponentialLR の gamma を明示指定 (指定するとスケジュール有効化。"
+                             "--ema 使用時の既定は 0.95)。")
     parser.add_argument("--no-offload", action="store_true",
-                        help="CPU オフロードを無効化して純粋な ZeRO-3 (全 GPU 常駐 + in-process GPU Adam) で動かす")
+                        help="CPU オフロードを無効化し、純粋な ZeRO-3 (全 GPU 常駐, "
+                             "in-process GPU Adam) で学習する。DPU は使えない。")
     args = parser.parse_args()
 
     if args.debug_params:
@@ -1174,6 +904,8 @@ def main():
         prefetch_bucket_size=int(args.prefetch_bucket_size),
         max_reuse_distance=int(args.max_reuse_distance),
         max_live_parameters=int(args.max_live_parameters),
+        eval_accuracy=args.eval_accuracy,
+        lr_decay=args.lr_decay,
         no_offload=args.no_offload,
     )
 

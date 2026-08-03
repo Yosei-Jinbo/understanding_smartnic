@@ -1,0 +1,9 @@
+export MASTER_PORT=29500
+export MASTER_ADDR=172.16.0.2
+export NCCL_IB_DISABLE=0
+export UCX_IB_MLX5_DEVX=y
+export UCX_TLS=rc,sm,self,tcp
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NCCL_SOCKET_IFNAME=enp207s0f0np0,enp207s0f1np1

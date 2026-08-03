@@ -1,25 +1,19 @@
 # common/debug_params.py
-"""
-ZeRO Stage 3 パラメータ検証用デバッグモジュール。
+"""ZeRO Stage 3 パラメータ検証用デバッグモジュール（--debug-params で有効化）。"""
 
---debug-params フラグで有効化すると、各ステップで以下を出力:
-  1. BEFORE_FWD:  順伝播前のローカルパーティション (ds_tensor)
-  2. AG_COMPLETE: AllGather完了後のフルパラメータ (param.data)
-  3. BEFORE_BWD:  逆伝播前のパラメータ (フルまたはパーティション)
-  4. PRE_RS:      ReduceScatter前の勾配
-  5. POST_RS:     ReduceScatter後の集約済み勾配
-  6. BEFORE_STEP: optimizer.step() 前の FP32 マスター重み
-  7. AFTER_STEP:  optimizer.step() 後の FP32 マスター重み
-  8. AFTER_COPY:  FP32→FP16 コピー後の FP16 パーティション
-"""
-
+import os
 import torch
 import torch.distributed as dist
 
-ENABLED = False
+# 環境変数で制御可能:
+#   DEBUG_PARAMS=1            : --debug-params を付けなくても有効化
+#   DEBUG_PARAMS_MAX_STEPS=N  : 最初の N ステップだけ出力 (default 3)
+#   DEBUG_PARAMS_MAX_VALS=N   : 各テンソルで出力する要素数 (default 8, 0 以下なら全要素)
+# 基本的にはtinyNNでこの環境変数を立てて、正常に集合通信ができているのかを検証する
+ENABLED = os.environ.get("DEBUG_PARAMS", "0") == "1"
 STEP = 0
-MAX_STEPS = 3   # 最初の N ステップのみ出力
-MAX_VALS = 8    # 出力する値の最大数
+MAX_STEPS = int(os.environ.get("DEBUG_PARAMS_MAX_STEPS", "3"))   # 最初の N ステップのみ出力
+MAX_VALS = int(os.environ.get("DEBUG_PARAMS_MAX_VALS", "8"))     # 出力する値の最大数 (0 以下で全要素)
 
 
 def enable(flag=True):
@@ -40,18 +34,18 @@ def _rank():
     return dist.get_rank() if dist.is_initialized() else 0
 
 
-def _fmt(t, max_vals=MAX_VALS):
-    """テンソルの統計情報と先頭値を文字列化"""
+def _fmt(t, max_vals=None):
+    """テンソルの統計情報と値を文字列化 (max_vals<=0 なら全要素)"""
+    if max_vals is None:
+        max_vals = MAX_VALS
     if t is None:
         return "None"
     t_flat = t.detach().float().flatten()
-    n = min(len(t_flat), max_vals)
+    n = t_flat.numel() if max_vals <= 0 else min(t_flat.numel(), max_vals)
     vals = ", ".join(f"{v:.6f}" for v in t_flat[:n].tolist())
-    suffix = f" ...({t_flat.numel()} total)" if t_flat.numel() > n else ""
+    suffix = f" ...({t_flat.numel()} total)" if n < t_flat.numel() else ""
     return f"shape={tuple(t.shape)} norm={t_flat.norm().item():.6f} mean={t_flat.mean().item():.6f} [{vals}{suffix}]"
 
-
-# ========== Public API ==========
 
 def log_before_forward(sub_module):
     """順伝播前: サブモジュールの各パラメータのローカルパーティション (ds_tensor) を出力"""
@@ -89,11 +83,12 @@ def log_before_backward(sub_module):
 
 
 def log_reduce_scatter(pre_rs_tensor, post_rs_tensors, sub_group_id):
-    """ReduceScatter 前後の勾配を出力"""
+    """ReduceScatter 前後の勾配を出力 (pre / post のうち渡された方だけ出す)"""
     if not should_log():
         return
     rank = _rank()
-    print(f"[DEBUG step={STEP} rank={rank}] PRE_RS  sub_group={sub_group_id} {_fmt(pre_rs_tensor)}", flush=True)
+    if pre_rs_tensor is not None:
+        print(f"[DEBUG step={STEP} rank={rank}] PRE_RS  sub_group={sub_group_id} {_fmt(pre_rs_tensor)}", flush=True)
     if post_rs_tensors is not None:
         for i, t in enumerate(post_rs_tensors):
             print(f"[DEBUG step={STEP} rank={rank}] POST_RS sub_group={sub_group_id} part[{i}] {_fmt(t)}", flush=True)

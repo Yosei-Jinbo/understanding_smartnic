@@ -4,22 +4,15 @@ import torch
 from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
 
-# ------------------------------------------------------------
 # 共通：ImageNetの正規化（転移学習との相性◎）
-# ------------------------------------------------------------
 IMAGENET_MEAN, IMAGENET_STD = (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
 
 # すべてのデータセットの既定root
 DEFAULT_ROOT = "/home/y-jinbo/HasegawaLab/performance_evaluation/common/data"
 
 
-# ------------------------------------------------------------
-# ヘルパ：torchvisionバージョン差異に強い label 取得
-# ------------------------------------------------------------
 def _get_targets(dataset):
-    """
-    torchvision のバージョンによって .targets or .y の場合があるため吸収
-    """
+    """torchvision のバージョンによって .targets or .y の場合があるため吸収"""
     if hasattr(dataset, "targets"):
         return dataset.targets
     if hasattr(dataset, "y"):
@@ -27,12 +20,8 @@ def _get_targets(dataset):
     raise AttributeError("Dataset has neither .targets nor .y to read labels.")
 
 
-# ------------------------------------------------------------
-# ヘルパ：ラベル配列から (0始まりlabels, num_classes) を推定
-# ------------------------------------------------------------
 def _normalize_labels_and_count_classes(labels):
-    """
-    任意の整数ラベル配列を 0 始まりに詰めて、クラス数を返す。
+    """任意の整数ラベル配列を 0 始まりに詰めて、クラス数を返す。
     例) Caltech-256 のように 1..257 でも安全に扱える。
     """
     labels = [int(y) for y in labels]
@@ -43,12 +32,8 @@ def _normalize_labels_and_count_classes(labels):
     return labels, num_classes
 
 
-# ------------------------------------------------------------
-# クラスごとに train/test を分割（再現性あり）
-# ------------------------------------------------------------
 def _split_by_class_indices(labels_zero_based, num_classes, train_per_class=None, train_ratio=None, seed=0):
-    """
-    クラスごとにインデックスを集約し、学習/評価へ分割。
+    """クラスごとにインデックスを集約し、学習/評価へ分割（再現性あり）。
     優先度: train_per_class > train_ratio
       - train_per_class: 各クラスの学習枚数（例: 60）
       - train_ratio: 各クラスの割合（例: 0.8）
@@ -74,9 +59,6 @@ def _split_by_class_indices(labels_zero_based, num_classes, train_per_class=None
     return train_idx, test_idx
 
 
-# ------------------------------------------------------------
-# DataLoader を返すエントリポイント
-# ------------------------------------------------------------
 def get_dataloaders(
     dataset_name="CIFAR10",
     batch_size=32,
@@ -90,18 +72,7 @@ def get_dataloaders(
     caltech256_download=False,  # 手動DL済みを既定想定
     root=DEFAULT_ROOT,
 ):
-    """
-    共通 DataLoader を返す関数（train_loader, test_loader）
-
-    Args:
-        dataset_name (str): "CIFAR10", "CIFAR100", "Caltech256", ...
-        batch_size (int)
-        num_workers (int)
-        resize_to_imagenet (bool): True の場合、CIFAR10/100 も 224x224 にリサイズして返す
-        caltech256_*: Caltech-256 分割の制御
-        caltech256_download (bool): Caltech-256 を torchvision からDLするか
-        root (str): データ保存先
-    """
+    """共通 DataLoader を返す関数（train_loader, test_loader）"""
     train_dataset, test_dataset = get_datasets(
         dataset_name=dataset_name,
         batch_size=batch_size,
@@ -135,9 +106,6 @@ def get_dataloaders(
     return train_loader, test_loader
 
 
-# ------------------------------------------------------------
-# Dataset を返すエントリポイント
-# ------------------------------------------------------------
 def get_datasets(
     dataset_name="CIFAR10",
     batch_size=32,
@@ -154,16 +122,7 @@ def get_datasets(
     caltech256_download=False,  # 404回避のため False を既定
     root=DEFAULT_ROOT,
 ):
-    """
-    共通 Dataset を返す関数（train_dataset, test_dataset）
-
-    Args:
-        dataset_name (str): "CIFAR10", "CIFAR100", "Food101", "Places365", "ImageNet", "Caltech256"
-        resize_to_imagenet (bool): True の場合、CIFAR10/100 も（デフォルト）224x224 にリサイズ
-        cifar_img_size (int|None): resize_to_imagenet=True のときの crop サイズ（例: 192）
-        caltech256_*: Caltech-256 の分割・DL制御
-        root (str): データ保存先
-    """
+    """共通 Dataset を返す関数（train_dataset, test_dataset）"""
     name = dataset_name.lower()
 
     if name == "cifar10":

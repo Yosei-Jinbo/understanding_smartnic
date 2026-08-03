@@ -19,10 +19,8 @@ import nvtx as pnvtx
 from common.dataset import get_datasets
 from common.model import get_benchmark_model
 from common.utils import (
-    ThroughputMeter,
     memory_usage_rank,
     start_profiler,
-    evaluate_zero3,
     SynchronizedWallClockTimer,
 )
 from zero_wrapper_example import ZeroWrapperExample
@@ -650,23 +648,8 @@ def run_zero(use_profiler=False, use_bf16=False, use_ema=False,
         timers = SynchronizedWallClockTimer()
         timers("opt_dpu")
 
-        throughput_every = 10000
         timer_every = 10000
         since_last_timer = 0
-
-        try:
-            throughput_meter = ThroughputMeter(
-                warmup_steps=5,
-                steps_per_output=throughput_every,
-                device=device,
-                model=model,
-            )
-        except TypeError:
-            throughput_meter = ThroughputMeter(
-                warmup_steps=5,
-                steps_per_output=throughput_every,
-            )
-        throughput_meter.start()
 
         if use_profiler:
             log_dir = f"./profiler_log/rank_{rank}"
@@ -866,13 +849,12 @@ def run_zero(use_profiler=False, use_bf16=False, use_ema=False,
                         _pp.set_ag_phase("forward")
                         timers("fwd").start()
                         t0 = time.perf_counter()
-                        with throughput_meter(batch_size=bsz):
-                            if is_causal_lm or is_mlm:
-                                output = zero_model.forward(input_ids=input_ids, attention_mask=attention_mask, labels=lm_labels)
-                                loss = output.loss.float()
-                            else:
-                                logits = zero_model.forward(images)
-                                loss = loss_fn(logits.float(), labels)
+                        if is_causal_lm or is_mlm:
+                            output = zero_model.forward(input_ids=input_ids, attention_mask=attention_mask, labels=lm_labels)
+                            loss = output.loss.float()
+                        else:
+                            logits = zero_model.forward(images)
+                            loss = loss_fn(logits.float(), labels)
                         timers("fwd").stop()
                         _record_step_time("fwd", time.perf_counter() - t0)
 
@@ -917,13 +899,12 @@ def run_zero(use_profiler=False, use_bf16=False, use_ema=False,
                         _pp.set_ag_phase("forward")
                         timers("fwd").start()
                         t0 = time.perf_counter()
-                        with throughput_meter(batch_size=bsz):
-                            if is_causal_lm or is_mlm:
-                                output = zero_model.forward(input_ids=input_ids, attention_mask=attention_mask, labels=lm_labels)
-                                loss = output.loss.float()
-                            else:
-                                logits = zero_model.forward(images)
-                                loss = loss_fn(logits.float(), labels)
+                        if is_causal_lm or is_mlm:
+                            output = zero_model.forward(input_ids=input_ids, attention_mask=attention_mask, labels=lm_labels)
+                            loss = output.loss.float()
+                        else:
+                            logits = zero_model.forward(images)
+                            loss = loss_fn(logits.float(), labels)
                         timers("fwd").stop()
                         _record_step_time("fwd", time.perf_counter() - t0)
 
@@ -964,7 +945,7 @@ def run_zero(use_profiler=False, use_bf16=False, use_ema=False,
                     if profiler:
                         prof.step()
 
-                    if getattr(throughput_meter, "_warmup_done", False):
+                    if global_iter > 5:  # 旧 ThroughputMeter の warmup 判定 (5 step) と同等
                         if since_last_timer % timer_every == 0:
                             timer_names = ["fwd", "bwd", "opt"] if epoch <= DPU_THRESHOLD else ["fwd", "bwd", "opt_dpu"]
                             timers.log(
@@ -1097,7 +1078,6 @@ def run_zero(use_profiler=False, use_bf16=False, use_ema=False,
         if rank == 0:
             _print_all_epochs_stats()
             _print_all_comm_stats()
-            throughput_meter.summary()
 
             try:
                 print(memory_usage_rank(model, optimizer=optimizer))

@@ -26,5 +26,5 @@ MLP=1.5e8
 export NCCL_MIN_NCHANNELS=8
 export NCCL_MAX_NCHANNELS=8
 
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../_prefetch_run.sh"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../../_prefetch_run.sh"
 run_prefetch "$@"

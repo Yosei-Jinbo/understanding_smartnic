@@ -19,5 +19,5 @@ RB=5e8
 PB=3e8
 MLP=3e8
 
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../_prefetch_run.sh"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../../_prefetch_run.sh"
 run_prefetch "$@"

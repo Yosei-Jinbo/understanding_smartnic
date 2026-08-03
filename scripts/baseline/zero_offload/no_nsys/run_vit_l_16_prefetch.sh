@@ -25,7 +25,7 @@ torchrun \
     --dataset cifar10 \
     --batch-size 64 \
     --warmup-iters 10 \
-    --measure-iters 100 \
+    --measure-iters 30 \
     --reduce-bucket-size 1e8 \
     --prefetch-bucket-size 1e8 \
     --max-live-parameters 1.5e8

@@ -23,5 +23,5 @@ PB=5e8
 MLP=5e8
 EXTRA_ARGS="--no-offload"
 
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../_prefetch_run.sh"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../../_prefetch_run.sh"
 run_prefetch "$@"
