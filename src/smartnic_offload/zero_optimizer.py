@@ -927,17 +927,16 @@ class ZeroOptimizer3(object):
             if same_buffer:
                 pass  # RS出力が直接grad_bufferに書き込まれている: コピー不要
             elif self.micro_step_id == 0:
-                # D2H の時間は NVTX 区間 'xfer:grad_d2h' の memcpy 射影 (nsys) で取得する。
-                if self.gradient_accumulation_steps > 1:
-                    # accum あり: この micro_step の勾配を CPU アキュムレータに種として書く
-                    # (次以降の micro_step が add_ で読むため)。
-                    torch.cuda.nvtx.range_push("xfer:grad_d2h")
-                    try:
-                        grad_buffer.copy_(grad_partition, non_blocking=True)
-                    finally:
-                        torch.cuda.nvtx.range_pop()
-                # 下流の fp32 コピーは grad_partition (RS 出力そのもの) から読む (baseline と同じ)。
-                grad_buffer = grad_partition
+                # fp16 のまま CPU pinned バッファへプレーン D2H する (高速なエンジンコピー)。
+                # ここで grad_buffer = grad_partition (GPU) に付け替えて下流の
+                # fp32_grad_tensor.copy_() に GPU fp16 を直接渡すと、型変換つき
+                # cross-device コピー (~5.3GB/s) に落ちて __partition_grads が
+                # +400ms/step 遅くなる (nsys 実測)。下流は CPU fp16 から読む。
+                torch.cuda.nvtx.range_push("xfer:grad_d2h")
+                try:
+                    grad_buffer.copy_(grad_partition, non_blocking=True)
+                finally:
+                    torch.cuda.nvtx.range_pop()
             else:
                 if grad_buffer.device != grad_partition.device:
                     cuda_grad_buffer = grad_buffer.to(grad_partition.device, non_blocking=True)
