@@ -1,6 +1,7 @@
 import sys
 import os
 import argparse
+import collections
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from common.utils import logger
 
@@ -18,22 +19,12 @@ from torch.nn import Module
 from torch.nn import Parameter
 import torch.distributed as dist
 from stage3_utils import * #parameterの持ち方が違うため独自のmemory_usage関数を呼ぶ
-import threading
-import time
-
-# ---- Completion poller gate (CUPTI/nsys との衝突回避用) ----
-# DISABLE_COMPLETION_POLLER=1 で _CompletionPoller(DOCA) を抑止。poller は別スレッドから
-# CUDA/DOCA API を高頻度に叩き、nsys の CUPTI hook と干渉して SIGSEGV を起こすことがある。
-# 無効化すると block_ms / dpu_ms の detailed 統計は取れないが学習の正しさには影響しない。
-_DISABLE_COMPLETION_POLLER = os.environ.get("DISABLE_COMPLETION_POLLER", "0") == "1"
 
 # SMARTNIC_L2_PREWARM=1 で AG 完了後に param.data を一度 read する kernel を挟む。
 # DOCA GPUDirect RDMA は L2 bypass で DRAM 直書きするため、後続 compute kernel が
 # L2 miss を起こす仮説の検証用。NCCL の ring-AG kernel が実行する staging read と
 # 等価な動作を挿入して、compute 時間が NCCL 配置と揃うかを確認する。
 _SMARTNIC_L2_PREWARM = os.environ.get("SMARTNIC_L2_PREWARM", "0") == "1"
-
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from pathlib import Path
 
@@ -43,36 +34,6 @@ sys.path.insert(0, str(COMCH_HOST_DIR))
 
 import doca_comch_client_pybind
 from doca_comch_client_pybind import CollectiveCommunication
-
-global_all_gather_id = 0
-global_reduce_scatter_id = 0
-
-# ds_id → param info table for correlating DPU-side rank skew records with parameter names.
-_ds_id_info = {}
-
-def register_ag_param_names(model):
-    """モデルを traverse して named_parameters の name を _ds_id_info に登録する。
-    Init() で ds_id が付与された後に呼ぶこと。"""
-    import torch.nn as _nn
-    if not isinstance(model, _nn.Module):
-        return
-    for name, param in model.named_parameters():
-        ds_id = getattr(param, 'ds_id', None)
-        if ds_id is not None and ds_id in _ds_id_info:
-            _ds_id_info[ds_id]['name'] = name
-
-def dump_ds_id_info(filepath):
-    """_ds_id_info を tab 区切りファイルに出力 (rank 0 のみ呼ぶこと)。"""
-    import os
-    os.makedirs(os.path.dirname(filepath), exist_ok=True) if os.path.dirname(filepath) else None
-    with open(filepath, 'w') as f:
-        f.write("# ds_id → param info dump (P2: Phase 13-A outlier 解析用)\n")
-        f.write(f"# total params: {len(_ds_id_info)}\n")
-        f.write("# format: ds_id\tname\tshape\tnumel\tdtype\n")
-        for ds_id in sorted(_ds_id_info.keys()):
-            info = _ds_id_info[ds_id]
-            f.write(f"{ds_id}\t{info.get('name', '<unknown>')}\t{info.get('shape', ())}\t{info.get('numel', 0)}\t{info.get('dtype', '?')}\n")
-    print(f"[P2] Dumped {len(_ds_id_info)} ds_id entries to {filepath}")
 
 class PartitionedParamStatus(Enum):
     # Partitioned parameters are present and ready for use
@@ -108,238 +69,29 @@ param_count = 0
 partitioned_param_data_shape = [0]
 zero_init_enabled = False
 
-# ---- all_gather 前の param shard H2D の GPU 時間集計 (CUDA event based, per-rank ms) ----
-PARAM_SHARD_H2D_TIME_MS: float = 0.0
-PARAM_SHARD_H2D_CALLS: int = 0
-
-def _accumulate_param_shard_h2d_time_ms(delta_ms: float) -> None:
-    global PARAM_SHARD_H2D_TIME_MS, PARAM_SHARD_H2D_CALLS
-    PARAM_SHARD_H2D_TIME_MS += float(delta_ms)
-    PARAM_SHARD_H2D_CALLS += 1
-
-def get_param_shard_h2d_time_ms() -> float:
-    return float(PARAM_SHARD_H2D_TIME_MS)
-
-def get_param_shard_h2d_calls() -> int:
-    return int(PARAM_SHARD_H2D_CALLS)
-
-# ---- parameter all_gather の通信時間集計 (CUDA event based, per-rank ms) ----
-ALL_GATHER_CALLS: int = 0
-ALL_GATHER_DPU_MS: float = 0.0       # DPU処理時間 (キュー待ち除去) の累計
-ALL_GATHER_BLOCK_MS: float = 0.0      # ブロック時間 (wait_start〜wait_end) の累計
-ALL_GATHER_BYTES: int = 0             # 転送バイト数の累計
-ALL_GATHER_LAST_COMPLETE: float = 0.0 # 直前のAGの t_complete (キュー待ち除去用)
-ALL_GATHER_LOCK = threading.Lock()
-
-def _accumulate_all_gather_detailed(t_request: float, t_complete: float, block_ms: float, nbytes: int = 0) -> None:
-    global ALL_GATHER_CALLS, ALL_GATHER_DPU_MS, ALL_GATHER_BLOCK_MS, ALL_GATHER_LAST_COMPLETE, ALL_GATHER_BYTES
-    with ALL_GATHER_LOCK:
-        # DPU処理時間 = t_complete - max(t_request, 直前のAG完了時刻)
-        # キュー待ち (直前AGの処理が終わるまで待つ時間) を除去した純粋な処理時間
-        dpu_start = max(t_request, ALL_GATHER_LAST_COMPLETE)
-        dpu_ms = (t_complete - dpu_start) * 1000.0
-        if dpu_ms < 0:
-            dpu_ms = 0.0
-        ALL_GATHER_DPU_MS += dpu_ms
-        ALL_GATHER_BLOCK_MS += float(block_ms)
-        ALL_GATHER_BYTES += nbytes
-        ALL_GATHER_LAST_COMPLETE = t_complete
-        ALL_GATHER_CALLS += 1
-
-def get_all_gather_calls() -> int:
-    return int(ALL_GATHER_CALLS)
-
-def get_all_gather_dpu_ms() -> float:
-    return float(ALL_GATHER_DPU_MS)
-
-def get_all_gather_block_ms() -> float:
-    return float(ALL_GATHER_BLOCK_MS)
-
-def get_all_gather_bytes() -> int:
-    return int(ALL_GATHER_BYTES)
-
-# ---- Forward / Backward AG block tracking ----
-_AG_PHASE = "unknown"  # "forward" or "backward"
-_AG_FWD_BLOCK_MS: float = 0.0
-_AG_BWD_BLOCK_MS: float = 0.0
-_AG_FWD_CALLS: int = 0
-_AG_BWD_CALLS: int = 0
-
-def set_ag_phase(phase: str) -> None:
-    global _AG_PHASE
-    _AG_PHASE = phase
-
-def _accumulate_phase_block(block_ms: float) -> None:
-    global _AG_FWD_BLOCK_MS, _AG_BWD_BLOCK_MS, _AG_FWD_CALLS, _AG_BWD_CALLS
-    if _AG_PHASE == "forward":
-        _AG_FWD_BLOCK_MS += block_ms
-        _AG_FWD_CALLS += 1
-    elif _AG_PHASE == "backward":
-        _AG_BWD_BLOCK_MS += block_ms
-        _AG_BWD_CALLS += 1
-
-def get_ag_phase_stats() -> dict:
-    return {
-        "fwd_block_ms": _AG_FWD_BLOCK_MS, "fwd_calls": _AG_FWD_CALLS,
-        "bwd_block_ms": _AG_BWD_BLOCK_MS, "bwd_calls": _AG_BWD_CALLS,
-    }
-
-def reset_ag_phase_stats() -> None:
-    global _AG_FWD_BLOCK_MS, _AG_BWD_BLOCK_MS, _AG_FWD_CALLS, _AG_BWD_CALLS
-    _AG_FWD_BLOCK_MS = _AG_BWD_BLOCK_MS = 0.0
-    _AG_FWD_CALLS = _AG_BWD_CALLS = 0
-
-# ---- per-AG/RS event-bracket stall tracker (両 mode 対称な真の stall 計測) ----
-# tracker への参照は遅延 import (importlib loop 回避)。env gate (`MEASURE_AG_STALL=1`) は
-# common/stall_event_tracker.py 側で判定する。
-def _stall_bracket(wait_callable, params_list=None, op: str = "ag", num_bytes: int = 0):
-    """wait_callable() が compute stream に enqueue する sync op の前後を CUDA event で囲み、
-    stream 上の真の stall ms を取得する (両 mode 対称)。"""
-    try:
-        from common import stall_event_tracker as _set  # type: ignore
-    except Exception:
-        return wait_callable()
-    if not _set.is_enabled():
-        return wait_callable()
-    tracker = _set.get_global()
-    if params_list:
-        try:
-            nbytes = sum(p.ds_numel * p.element_size() for p in params_list)
-        except Exception:
-            nbytes = num_bytes
-        ds_id = getattr(params_list[0], "ds_id", -1) if params_list else -1
-    else:
-        nbytes = num_bytes
-        ds_id = -1
-    stream = torch.cuda.current_stream()
-    handle = tracker.begin(stream, _AG_PHASE, op=op, ds_id=ds_id, payload_bytes=nbytes)
-    try:
-        return wait_callable()
-    finally:
-        tracker.end(handle)
-
-
-# ---- Per-AG detailed records for size-based analysis ----
-_AG_RECORDS: list = []   # [(nbytes, dpu_ms, block_ms, enqueue_ms, prefetch_lead_ms, wall_ms)]
-_AG_RECORDS_LOCK = threading.Lock()
-
-def _record_ag_detail(nbytes: int, dpu_ms: float, block_ms: float,
-                      enqueue_ms: float = 0.0, prefetch_lead_ms: float = 0.0,
-                      wall_ms: float = 0.0) -> None:
-    with _AG_RECORDS_LOCK:
-        _AG_RECORDS.append((nbytes, dpu_ms, block_ms, enqueue_ms, prefetch_lead_ms, wall_ms))
-
-def print_ag_analysis(epoch: int) -> None:
-    """Print per-AG size-bucket analysis at epoch end."""
-    with _AG_RECORDS_LOCK:
-        records = list(_AG_RECORDS)
-    if not records:
-        return
-
-    import statistics
-    # Size buckets: <1KB, 1-16KB, 16KB-1MB, 1-16MB, >16MB
-    buckets = [
-        ("<1KB",   0,        1024),
-        ("1-16KB", 1024,     16384),
-        ("16K-1M", 16384,    1048576),
-        ("1-16MB", 1048576,  16777216),
-        (">16MB",  16777216, float('inf')),
-    ]
-
-    print(f"========== Per-AG Analysis (Epoch {epoch}) ==========", flush=True)
-    print(f"  AG calls: {len(records)}", flush=True)
-
-    for label, lo, hi in buckets:
-        group = [(nb, dpu, blk, enq, pfl, wl) for nb, dpu, blk, enq, pfl, wl in records if lo <= nb < hi]
-        if not group:
-            continue
-        n = len(group)
-        avg_dpu = sum(d for _, d, _, _, _, _ in group) / n
-        avg_blk = sum(b for _, _, b, _, _, _ in group) / n
-        avg_enq = sum(e for _, _, _, e, _, _ in group) / n
-        avg_pfl = sum(p for _, _, _, _, p, _ in group) / n
-        avg_wl  = sum(w for _, _, _, _, _, w in group) / n
-        avg_sz  = sum(s for s, _, _, _, _, _ in group) / n
-        p99_blk = sorted(b for _, _, b, _, _, _ in group)[int(n * 0.99)] if n > 1 else avg_blk
-        p99_wl  = sorted(w for _, _, _, _, _, w in group)[int(n * 0.99)] if n > 1 else avg_wl
-        print(f"  {label:>7s}: calls={n:>6d} | avg_size={avg_sz/1024:.1f}KB | "
-              f"dpu={avg_dpu:.3f}ms | block={avg_blk:.3f}ms (p99={p99_blk:.3f}ms) | "
-              f"wall={avg_wl:.3f}ms (p99={p99_wl:.3f}ms) | "
-              f"prefetch_lead={avg_pfl:.1f}ms", flush=True)
-
-    # Top 10 blocking AGs
-    top_block = sorted(records, key=lambda r: r[2], reverse=True)[:10]
-    print(f"  Top 10 blocking AGs:", flush=True)
-    for nb, dpu, blk, enq, pfl, wl in top_block:
-        print(f"    size={nb/1024:.1f}KB | dpu={dpu:.3f}ms | block={blk:.3f}ms | wall={wl:.3f}ms | prefetch_lead={pfl:.1f}ms", flush=True)
-    print(f"{'=' * 55}", flush=True)
-
-def reset_ag_records() -> None:
-    with _AG_RECORDS_LOCK:
-        _AG_RECORDS.clear()
-
-FULL_PARAMETER_CALLS: int = 0
-FULL_PARAMETER_BYTES: int = 0
-FULL_PARAMETER_DMA_POLL_MS: float = 0.0  # DMA ポーリングによる合計時間
-FULL_PARAMETER_PENDING_EVENTS: list = []  # [(start_event, end_event), ...]
-FULL_PARAMETER_LOCK = threading.Lock()
-
-def _record_full_parameter_events(start_event: torch.cuda.Event, end_event: torch.cuda.Event, nbytes: int = 0, dma_poll_ms: float = 0.0) -> None:
-    global FULL_PARAMETER_CALLS, FULL_PARAMETER_BYTES, FULL_PARAMETER_DMA_POLL_MS
-    with FULL_PARAMETER_LOCK:
-        FULL_PARAMETER_PENDING_EVENTS.append((start_event, end_event))
-        FULL_PARAMETER_CALLS += 1
-        FULL_PARAMETER_BYTES += nbytes
-        FULL_PARAMETER_DMA_POLL_MS += dma_poll_ms
-
-def get_full_parameter_copy_ms() -> float:
-    """エポック末に呼ばれる。未処理の CUDA event ペアを同期して elapsed_time を合計する。
-    1エポックに1回の同期で済むため、per-call の同期オーバーヘッドがない。"""
-    with FULL_PARAMETER_LOCK:
-        if not FULL_PARAMETER_PENDING_EVENTS:
-            return 0.0
-        # 最後のイベントだけ同期すれば、それ以前の全イベントも完了している
-        FULL_PARAMETER_PENDING_EVENTS[-1][1].synchronize()
-        total_ms = 0.0
-        for start_ev, end_ev in FULL_PARAMETER_PENDING_EVENTS:
-            total_ms += start_ev.elapsed_time(end_ev)
-        FULL_PARAMETER_PENDING_EVENTS.clear()
-        return total_ms
-
-def get_full_parameter_calls() -> int:
-    return int(FULL_PARAMETER_CALLS)
-
-def get_full_parameter_bytes() -> int:
-    return int(FULL_PARAMETER_BYTES)
-
-def get_full_parameter_dma_poll_ms() -> float:
-    return float(FULL_PARAMETER_DMA_POLL_MS)
-
-def _scatter_flat_to_list(
-    flat_output: torch.Tensor,
-    output_tensors: List[torch.Tensor],
-    like_tensor: torch.Tensor,
-) -> None:
-    world_size = len(output_tensors)
-    numel_per_rank = like_tensor.numel()
-
-    flat_2d = flat_output.view(world_size, numel_per_rank)
-
-    for rank, out in enumerate(output_tensors):
-        out.copy_(flat_2d[rank].view_as(out))
-
-
+# H2D (param shard CPU->GPU) の所要時間は Nsight Systems の cuda memcpy トレースで取得する。
 class _ComchHandleWork:
-    """C 側の handle を保持して wait/test/release する Work。
-    gpu_flag_addr 指定時 (GPU flag 完了機構): wait() は cuStreamWaitValue32 を schedule して
-    即 return し Python はブロックしない (NCCL と同じ semantics)。未指定時は comch_req_wait_py でブロック。"""
-    def __init__(self, handle: int,
+    """C 側の handle を保持して wait/release する Work。
+
+    keep_alive: enqueue した src テンソル等を doorbell 完了 (=wait()) まで保持する。
+    pybind 側は生アドレスしか持たないため、Python 側で参照を切らすとアロケータが
+    バッファを再利用し、DPU が読む前に上書きされる use-after-free になる。
+    【必須】2026-07-18 実測: keep_alive なしで vit E1 0.3719→0.2674 に劣化 (実証済み)。
+
+    GPU flag path (gpu_flag_addr != 0): wait() は cuStreamWaitValue32 を
+    current stream に schedule して即 return する (Python はブロックしない)。
+    DPU は collective 完了時に flag_addr へ flag_value を RDMA Write するので、
+    後続 compute kernel は HW semaphore で AG 完了と同期する (NCCL と同じ semantics)。
+    この場合 keep_alive は _sweep_flag_keepalive の global deque が保持する
+    (wait() 即 return のためこの Work では DPU 読了を検知できない)。"""
+    def __init__(self, handle: int, keep_alive=None,
                  gpu_flag_addr: int = 0,
                  gpu_flag_value: int = 0,
-                 gpu_flag_device: "torch.device | None" = None) -> None:
+                 gpu_flag_device=None) -> None:
         self._handle = int(handle)
         self._released = False
         self._completed = False
+        self._keep_alive = keep_alive
         self._gpu_flag_addr = int(gpu_flag_addr)
         self._gpu_flag_value = int(gpu_flag_value)
         self._gpu_flag_device = gpu_flag_device
@@ -350,37 +102,28 @@ class _ComchHandleWork:
 
     def wait(self):
         if self.use_gpu_flag():
-            # GPU flag path: schedule cuStreamWaitValue and return immediately
+            # GPU flag path: cuStreamWaitValue を schedule して即 return
             if not self._gpu_flag_scheduled:
                 from cuda_stream_wait import stream_wait_value_eq
                 stream = torch.cuda.current_stream(self._gpu_flag_device)
                 stream_wait_value_eq(stream, self._gpu_flag_addr, self._gpu_flag_value)
                 self._gpu_flag_scheduled = True
-            # Mark Python-side completed (the actual GPU sync happens via the stream)
             self._completed = True
             if not self._released:
-                # Release the caller's refcnt; C-side completion thread will free
-                # the resources when DPU writes the doorbell.
+                # caller 側 refcnt を解放 (C 側 completion thread が doorbell を見て free)
                 doca_comch_client_pybind.comch_req_release_py(self._handle)
                 self._released = True
             return None
 
-        # Legacy path
+        # Legacy path (doorbell blocking wait)
         if not self._completed:
             doca_comch_client_pybind.comch_req_wait_py(self._handle)
             self._completed = True
+            self._keep_alive = None  # DPU 読了済み。バッファを解放してよい
         if not self._released:
             doca_comch_client_pybind.comch_req_release_py(self._handle)
             self._released = True
         return None
-
-    def is_completed(self) -> bool:
-        if self._completed:
-            return True
-        done = doca_comch_client_pybind.comch_req_test_py(self._handle)
-        if done:
-            self._completed = True
-        return done
 
     def __del__(self):
         # wait() せずに破棄された場合でもリークしないように release
@@ -405,61 +148,40 @@ def _scatter_flat_to_list(
         out.copy_(flat_2d[rank].view_as(out))
 
 
-class _AllGatherWork:
-    """DOCA ALL_GATHER(リスト版) 用の Work ハンドル（PyTorch の Work 風インターフェース）"""
-
-    def __init__(
-        self,
-        thread: threading.Thread,
-        output_flat: torch.Tensor,
-        output_tensors: List[torch.Tensor],
-        like_tensor: torch.Tensor,
-    ) -> None:
-        self._thread = thread
-        self._output_flat = output_flat
-        self._output_tensors = output_tensors
-        self._like_tensor = like_tensor
-        self._completed = False
-
-    def wait(self):
-        if not self._completed:
-            self._thread.join()
-            _scatter_flat_to_list(self._output_flat, self._output_tensors, self._like_tensor)
-            self._completed = True
-        # PyTorch collective の仕様に合わせて None を返す
-        return None
-
-    def is_completed(self) -> bool:
-        if self._completed:
-            return True
-        return not self._thread.is_alive()
+# ---------------------------------------------------------------------------
+# GPU flag path 用 keep_alive 管理。
+# flag path の wait() は即 return するため、enqueue 時の一時 src バッファを
+# 「DPU が読み終わった」と確認できるまで Python 側で保持する必要がある。
+# flag は pinned host memory なので CPU から安価に読める — enqueue のたびに
+# deque 先頭から「flag が gen に到達したエントリ」を掃除して参照を落とす。
+_flag_keepalive_q = collections.deque()  # (slot_id, gen, keep_alive)
 
 
-class _ReduceScatterWork:
-    """DOCA REDUCE_SCATTER(リスト版) 用の Work ハンドル"""
+def _sweep_flag_keepalive(pool) -> None:
+    while _flag_keepalive_q:
+        slot_id, gen, _ka = _flag_keepalive_q[0]
+        if pool.flag_reached(slot_id, gen):
+            _flag_keepalive_q.popleft()  # DPU 読了済み → 参照を落とす
+        else:
+            break  # レーン内 FIFO 完了なので先頭が未完了なら以降も未完了
 
-    def __init__(
-        self,
-        thread: threading.Thread,
-        output_flat: torch.Tensor,
-        output_tensor: torch.Tensor,
-    ) -> None:
-        self._thread = thread
-        self._output_flat = output_flat
-        self._output_tensor = output_tensor
-        self._completed = False
 
-    def wait(self):
-        if not self._completed:
-            self._thread.join()
-            self._output_tensor.copy_(self._output_flat.view_as(self._output_tensor))
-            self._completed = True
-        return None
+# ---------------------------------------------------------------------------
+# collective enqueue 前フック。
+# 遅延 submit 中の RS がある状態で別の collective (AG) を enqueue すると、
+# rank 間で collective の発行順序が GPU タイミング依存にズレて DPU の ring が
+# 噛み合わなくなる (RING_RECV Bad State)。AG enqueue の直前に保留 RS を強制
+# submit することで、全 rank の発行列を決定論的に揃える。
+_pre_enqueue_hooks = []
 
-    def is_completed(self) -> bool:
-        if self._completed:
-            return True
-        return not self._thread.is_alive()
+
+def register_pre_enqueue_hook(fn) -> None:
+    _pre_enqueue_hooks.append(fn)
+
+
+def _run_pre_enqueue_hooks() -> None:
+    for fn in _pre_enqueue_hooks:
+        fn()
 
 
 # =========================
@@ -476,6 +198,8 @@ def all_gather_list_via_base(
 
     if len(output_tensors) != world_size:
         raise ValueError(f"len(output_tensors)={len(output_tensors)} must equal world_size={world_size}")
+
+    _run_pre_enqueue_hooks()
 
     input_flat = input_tensor.contiguous().view(-1)
     output_flat = torch.empty(
@@ -507,50 +231,6 @@ def all_gather_list_via_base(
         return None
     else:
         return _AllGatherHandleWork(handle, output_flat, output_tensors, input_tensor)
-    
-# =========================
-# リスト版 ReduceScatter
-# =========================
-def reduce_scatter_list_via_base(
-    output_tensor: torch.Tensor,
-    input_tensors: List[torch.Tensor],
-    cid: int,
-    group: Optional[dist.ProcessGroup] = None,
-    async_op: bool = False,
-):
-    world_size = dist.get_world_size()
-
-    if len(input_tensors) != world_size:
-        raise ValueError(f"len(input_tensors)={len(input_tensors)} must equal world_size={world_size}")
-
-    out_numel = output_tensor.numel()
-
-    flat_list = [t.contiguous().view(-1) for t in input_tensors]
-    input_flat = torch.cat(flat_list, dim=0).contiguous()
-
-    output_flat = torch.empty(out_numel, dtype=output_tensor.dtype, device=output_tensor.device).contiguous()
-
-    handle = doca_comch_client_pybind.ucp_collective_enqueue_py(
-        cid, input_flat, output_flat, CollectiveCommunication.REDUCE_SCATTER
-    )
-
-    class _ReduceScatterHandleWork(_ComchHandleWork):
-        def __init__(self, h, out_flat, out_t):
-            super().__init__(h)
-            self._out_flat = out_flat
-            self._out_t = out_t
-
-        def wait(self):
-            super().wait()
-            self._out_t.copy_(self._out_flat.view_as(self._out_t))
-            return None
-
-    if not async_op:
-        w = _ReduceScatterHandleWork(handle, output_flat, output_tensor)
-        w.wait()
-        return None
-    else:
-        return _ReduceScatterHandleWork(handle, output_flat, output_tensor)
 
 # =========================
 # フラット版 AllGather
@@ -564,31 +244,42 @@ def all_gather_flat_via_base(
 ):
     world_size = dist.get_world_size()
 
+    _run_pre_enqueue_hooks()
+
     in_view = input_flat.contiguous().view(-1)
     out_view = output_flat.contiguous().view(-1)
 
-    # GPU flag pool が enable なら slot を取得して flag-aware enqueue を使う
+    # GPU flag pool が enable なら flag-aware enqueue (Python 無ブロック wait)
+    _gfp = None
     try:
-        import gpu_flag_pool as _gfp
+        import gpu_flag_pool as _gfp_mod
+        if _gfp_mod.is_enabled():
+            _gfp = _gfp_mod
     except ImportError:
-        _gfp = None
+        pass
 
-    if _gfp is not None and _gfp.is_enabled():
+    if _gfp is not None:
         pool = _gfp.get_global_pool()
-        slot_id, gen, gpu_addr, expected = pool.acquire()
+        _sweep_flag_keepalive(pool)  # 完了済みエントリの keep_alive を解放
+        slot_id, gen, flag_addr, expected = pool.acquire()
         handle = doca_comch_client_pybind.ucp_collective_enqueue_with_flag_py(
             cid, in_view, out_view, CollectiveCommunication.ALL_GATHER,
-            gpu_addr, expected
+            flag_addr, expected
         )
+        # in_view の生存は flag 到達を確認するまで global deque が保証する
+        # (flag path の wait() は即 return し DPU 読了を検知できないため)
+        _flag_keepalive_q.append((slot_id, gen, (in_view,)))
         work = _ComchHandleWork(handle,
-                                gpu_flag_addr=gpu_addr,
+                                gpu_flag_addr=flag_addr,
                                 gpu_flag_value=expected,
                                 gpu_flag_device=out_view.device)
     else:
         handle = doca_comch_client_pybind.ucp_collective_enqueue_py(
             cid, in_view, out_view, CollectiveCommunication.ALL_GATHER
         )
-        work = _ComchHandleWork(handle)
+        # in_view を doorbell 完了まで保持 (coalesced AG の src は呼び出し元の
+        # 一時 pinned バッファで、これが唯一の参照になる)
+        work = _ComchHandleWork(handle, keep_alive=(in_view,))
 
     if not async_op:
         work.wait()
@@ -596,39 +287,18 @@ def all_gather_flat_via_base(
     else:
         return work
 
-# =========================
-# フラット版 ReduceScatter
-# =========================
-def reduce_scatter_flat_via_base(
-    output_flat: torch.Tensor,
-    input_flat: torch.Tensor,
-    cid: int,
-    group: Optional[dist.ProcessGroup] = None,
-    async_op: bool = False,
-):
-    world_size = dist.get_world_size()
-
-    out_view = output_flat.contiguous().view(-1)
-    in_view = input_flat.contiguous().view(-1)
-
-    handle = doca_comch_client_pybind.ucp_collective_enqueue_py(
-        cid, in_view, out_view, CollectiveCommunication.REDUCE_SCATTER
-    )
-    if not async_op:
-        w = _ComchHandleWork(handle)
-        w.wait()
-        return None
-    else:
-        return _ComchHandleWork(handle)
-    
 def _dist_allgather_fn(
     input_flat: torch.Tensor,
     output_flat: torch.Tensor,
     cid: int,
     group=None,
 ):
-    """ZeRO 内部で使う flat all_gather のラッパ (async)。
-    cid は collective を識別する一意 ID (param.ds_id など)。"""
+    """
+    ZeRO 内部で使う flat all_gather のラッパ。
+    - input_flat : 各 rank の shard (1D)
+    - output_flat: [world_size * shard] (1D)
+    - cid        : collective を識別する一意 ID（param.ds_id など）
+    """
 
     return all_gather_flat_via_base(
         output_flat=output_flat,
@@ -741,8 +411,12 @@ temp_contiguous_tensor = None
 empty_buffers = {}
 
 
-#with ブロック中だけ全 nn.Module サブクラスの __init__ を差し替え、
-#初期化直後に ZeRO-3 向け post-init (分割/収集の管理) を自動で挟み込む
+'''
+with InsertPostInitMethodToModuleSubClasses(...): のブロックに入っている間だけ、
+すべての torch.nn.Module サブクラスの __init__ 振る舞いを差し替えて、
+**初期化直後に ZeRO-3 向けの後処理（post-init：分割/収集の管理など）**を自動で挟み込みます。
+メモリ効率の良いテンソル生成・Linear 演算への差し替えも同時に行います。
+'''
 class InsertPostInitMethodToModuleSubClasses(object):
     def __init__(self, enabled=True, dtype=None):
         self.enabled = enabled
@@ -764,7 +438,16 @@ class InsertPostInitMethodToModuleSubClasses(object):
                 
                 @functools.wraps(fn_to_apply)
                 def wrapped_fn_to_apply(module_to_apply_fn_to: Module) -> None:
-                    """apply 前に all-gather し、fn 適用後 rank0 から broadcast して再分割する。"""
+                    """gathers parameters before calling apply function. afterwards
+                    parameters are broadcasted to ensure consistency across all ranks
+                    then re-partitioned.
+
+                    takes the following steps:
+                    1. allgathers parameters for the current module being worked on
+                    2. calls the original function
+                    3. broadcasts root rank's parameters to the other ranks
+                    4. re-partitions the parameters
+                    """
                     if not all(is_zero_param(p) for p in module_to_apply_fn_to.parameters(recurse=False)):
                         raise RuntimeError(
                             f"not all parameters for {module_to_apply_fn_to.__class__.__name__}, "
@@ -803,7 +486,13 @@ class InsertPostInitMethodToModuleSubClasses(object):
             @functools.wraps(f)
             def wrapper(module, *args, **kwargs):
 
-                # post_init は子の __init__ 完了直後に 1 回だけ走らせる (親・祖先の __init__ 後には走らせない)
+                # important logic: We want to run post_init only after child's __init__ is
+                # completed, and do nothing after __init__ of any of its parents and grandparents in
+                # the inheritance ancestry. This way the partitioning will need to happen only once
+                # when the whole object is ready to be partitioned and not before. This is because
+                # often the child module will need to tweak the weights - for example running a
+                # custom weights init function. So if a parent created the weights param, the child
+                # won't need to gather it in order to tweak it
 
                 print_rank_0(f'Before initializing {module.__class__.__name__}',
                              force=False)
@@ -839,6 +528,7 @@ class InsertPostInitMethodToModuleSubClasses(object):
             
         # Replace .__init__() for all existing subclasses of torch.nn.Module recursively
         for subclass in get_all_subclasses(torch.nn.modules.module.Module):
+            # print(f"subclass={subclass.__module__}.{subclass.__qualname__}")
             _enable_class(subclass)
 
         # holding onto some methods so we can put them back the way they were in __exit__
@@ -905,98 +595,28 @@ def shutdown_init_context():
 
     zero_init_enabled = False
 
-class _CompletionPoller:
-    """バックグラウンドスレッドで is_completed() をポーリングし、
-    DPU 完了通知の到着時刻 t_complete を記録する。
-    100μs 間隔の sleep で GIL 負荷を最小化。"""
-
-    _POLL_INTERVAL = 0.0001  # 100μs
-
-    def __init__(self, handle):
-        self._handle = handle
-        self.t_complete = None
-        self._thread = threading.Thread(target=self._poll, daemon=True)
-        self._thread.start()
-
-    def _poll(self):
-        # is_completed() だと _completed=True が立ち main thread の wait() が
-        # comch_req_wait_py をスキップしてしまうため comch_req_test_py を直接呼ぶ
-        handle_id = self._handle._handle
-        while not doca_comch_client_pybind.comch_req_test_py(handle_id):
-            time.sleep(self._POLL_INTERVAL)
-        self.t_complete = time.perf_counter()
-
-    def join(self):
-        self._thread.join()
-
-
-
 '''waitはpartitioned_param_coordinator.pyで呼ばれてます'''
 class AllGatherHandle:
-    def __init__(self, handle, param: Parameter, t_request=None, start_event=None) -> None:
+    def __init__(self, handle, param: Parameter) -> None:
         if param.ds_status != ZeroParamStatus.INFLIGHT:
             raise RuntimeError(f"expected param {param.ds_summary()} to be available")
         self.__handle = handle
         self.__param = param
-        self.__t_request = t_request
-        self.__use_poller = (
-            t_request is not None
-            and hasattr(handle, 'is_completed')
-            and not _DISABLE_COMPLETION_POLLER
-        )
-        self.__use_gpu_flag = hasattr(handle, 'use_gpu_flag') and handle.use_gpu_flag()
 
     def wait(self) -> None:
-        t_wait_start = time.perf_counter()
-
-        if self.__use_gpu_flag:
-            # GPU flag path: cuStreamWaitValue を schedule して即 return (Python は非ブロック)。
-            # bracket で compute stream 上の真の stall を測る
-            _stall_bracket(instrument_w_nvtx(self.__handle.wait), [self.__param], op="ag")
-            t_after = time.perf_counter()
-            block_ms = (t_after - t_wait_start) * 1000.0  # この値は scheduling overhead のみ (~μs)
-            if self.__t_request is not None:
-                nbytes = self.__param.ds_numel * self.__param.element_size()
-                prefetch_lead_ms = (t_wait_start - self.__t_request) * 1000.0
-                wall_ms = (t_after - self.__t_request) * 1000.0
-                _accumulate_all_gather_detailed(self.__t_request, t_after, block_ms, nbytes)
-                _record_ag_detail(nbytes, 0.0, block_ms, 0.0, prefetch_lead_ms, wall_ms)
-                _accumulate_phase_block(block_ms)
-            self.__param.ds_status = ZeroParamStatus.AVAILABLE
-            return
-
-        if self.__use_poller:
-            poller = _CompletionPoller(self.__handle)
-            poller.join()
-            t_complete = poller.t_complete or time.perf_counter()
-            block_ms = (t_complete - t_wait_start) * 1000.0
-            nbytes = self.__param.ds_numel * self.__param.element_size()
-            dpu_start = max(self.__t_request, ALL_GATHER_LAST_COMPLETE)
-            dpu_ms = (t_complete - dpu_start) * 1000.0
-            prefetch_lead_ms = (t_wait_start - self.__t_request) * 1000.0
-            wall_ms = (t_complete - self.__t_request) * 1000.0
-            _accumulate_all_gather_detailed(self.__t_request, t_complete, block_ms, nbytes)
-            _record_ag_detail(nbytes, max(0.0, dpu_ms), block_ms, 0.0, prefetch_lead_ms, wall_ms)
-            _accumulate_phase_block(block_ms)
-
-        # poller 完了後の wait() は release 中心の軽い処理だが、対称性のため bracket する
-        _stall_bracket(instrument_w_nvtx(self.__handle.wait), [self.__param], op="ag")
+        # gpu-flag handle は cuStreamWaitValue を schedule して即 return
+        # (Python は一切ブロックしない)。legacy handle は comch_req_wait でブロック。
+        instrument_w_nvtx(self.__handle.wait)()
         self.__param.ds_status = ZeroParamStatus.AVAILABLE
 
+
 class AllGatherCoalescedHandle:
-    def __init__(self, allgather_handle, params: List[Parameter], partitions: List[Tensor], world_size: int, t_request=None, start_event=None) -> None:
+    def __init__(self, allgather_handle, params: List[Parameter], partitions: List[Tensor], world_size: int) -> None:
         self.__allgather_handle = allgather_handle
         self.__params = params
         self.__partitions = partitions
         self.__world_size = world_size
-        self.__t_request = t_request
         self.__complete = False
-        self.__use_poller = (
-            t_request is not None
-            and hasattr(allgather_handle, 'is_completed')
-            and not _DISABLE_COMPLETION_POLLER
-        )
-        self.__use_gpu_flag = hasattr(allgather_handle, 'use_gpu_flag') and allgather_handle.use_gpu_flag()
         for param in self.__params:
             if param.ds_status != ZeroParamStatus.INFLIGHT:
                 raise RuntimeError(
@@ -1006,45 +626,9 @@ class AllGatherCoalescedHandle:
     def wait(self) -> None:
         if self.__complete:
             return
-        t_wait_start = time.perf_counter()
-
-        if self.__use_gpu_flag:
-            # GPU flag path: cuStreamWaitValue を schedule して即 return。
-            # bracket で compute stream 上の真の stall を測る
-            _stall_bracket(instrument_w_nvtx(self.__allgather_handle.wait),
-                           list(self.__params), op="ag")
-            t_after = time.perf_counter()
-            block_ms = (t_after - t_wait_start) * 1000.0
-            if self.__t_request is not None:
-                nbytes = sum(p.ds_numel * p.element_size() for p in self.__params)
-                prefetch_lead_ms = (t_wait_start - self.__t_request) * 1000.0
-                wall_ms = (t_after - self.__t_request) * 1000.0
-                _accumulate_all_gather_detailed(self.__t_request, t_after, block_ms, nbytes)
-                _record_ag_detail(nbytes, 0.0, block_ms, 0.0, prefetch_lead_ms, wall_ms)
-                _accumulate_phase_block(block_ms)
-            self.__t_request = None
-        elif self.__use_poller:
-            poller = _CompletionPoller(self.__allgather_handle)
-            poller.join()
-            t_complete = poller.t_complete or time.perf_counter()
-            block_ms = (t_complete - t_wait_start) * 1000.0
-            nbytes = sum(p.ds_numel * p.element_size() for p in self.__params)
-            dpu_start = max(self.__t_request, ALL_GATHER_LAST_COMPLETE)
-            dpu_ms = (t_complete - dpu_start) * 1000.0
-            prefetch_lead_ms = (t_wait_start - self.__t_request) * 1000.0
-            wall_ms = (t_complete - self.__t_request) * 1000.0
-            _accumulate_all_gather_detailed(self.__t_request, t_complete, block_ms, nbytes)
-            _record_ag_detail(nbytes, max(0.0, dpu_ms), block_ms, 0.0, prefetch_lead_ms, wall_ms)
-            _accumulate_phase_block(block_ms)
-            self.__poller = None
-            self.__t_request = None
-            # release 処理 (poller 完了後なので安全)。対称性のため bracket で計測
-            _stall_bracket(instrument_w_nvtx(self.__allgather_handle.wait),
-                           list(self.__params), op="ag")
-        else:
-            self.__t_request = None
-            _stall_bracket(instrument_w_nvtx(self.__allgather_handle.wait),
-                           list(self.__params), op="ag")
+        # gpu-flag handle は cuStreamWaitValue を schedule して即 return。
+        # legacy handle は comch_req_wait でブロック。
+        instrument_w_nvtx(self.__allgather_handle.wait)()
 
         param_offset = 0
         for param in self.__params:
@@ -1076,67 +660,11 @@ class AllGatherCoalescedHandle:
         self.__partitions = None   # flat_tensor への参照を解放し、GPU メモリの再利用を可能にする
         self.__complete = True
 
-class CPUAllGatherCoalescedHandle:
-    """cpu_full_param からのローカルコピーだけで all-gather を完了させるハンドル。
-    通信は行わず、.wait() 時に CPU→GPU コピーして AVAILABLE にする。"""
-
-    def __init__(self, params: List[Parameter], device: torch.device, t_request=None, start_event=None) -> None:
-        self.__params = list(params)
-        self.__device = device
-        self.__complete = False
-        self.__t_request = t_request
-
-        # all_gather_coalesced 側で INFLIGHT にされている前提
-        for p in self.__params:
-            if p.ds_status != ZeroParamStatus.INFLIGHT:
-                raise RuntimeError(
-                    f"expected param {p.ds_summary()} to be inflight for CPUAllGatherCoalescedHandle"
-                )
-
-    @instrument_w_nvtx
-    def wait(self) -> None:
-        if self.__complete:
-            return
-
-        # CUDA event: コピー前に start を記録
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-        start_event.record()
-
-        with torch.no_grad():
-            for p in self.__params:
-                cpu_full = getattr(p, "cpu_full_param", None)
-                if cpu_full is None:
-                    raise RuntimeError(
-                        f"cpu_full_param is None for param {p.ds_summary()} in CPUAllGatherCoalescedHandle"
-                    )
-                if cpu_full.numel() != p.ds_numel:
-                    raise RuntimeError(
-                        f"numel mismatch in cpu_full_param for {p.ds_summary()}: "
-                        f"cpu_full_param.numel={cpu_full.numel()} vs ds_numel={p.ds_numel}"
-                    )
-
-                # CPU -> GPU に復元（local_device か param.device に合わせる）
-                full_gpu = cpu_full.to(self.__device, non_blocking=True)
-                full_gpu = full_gpu.view(p.ds_shape)
-
-                p.data = full_gpu
-                p.ds_status = ZeroParamStatus.AVAILABLE
-
-                from common import debug_params as dbg
-                dbg.log_ag_complete(p, tag="AG_COMPLETE(cpu_full)")
-
-        # CUDA event: コピー後に end を記録 (同期はエポック末に1回だけ)
-        end_event.record()
-
-        # H2D コピーは current stream 上で発行済みで、後続の GPU op がストリーム順序で
-        # 自然に完了を待つため、ホスト側の完了待ちは不要。転送時間は CUDA event で取得。
-        nbytes = sum(p.ds_numel * p.element_size() for p in self.__params)
-        _record_full_parameter_events(start_event, end_event, nbytes, 0.0)
-
-        self.__complete = True
-
-#DeepSpeed ZeRO-3 の初期化コンテキスト (zero.Init): モデルを初期化しつつその場でパラメータを分割する
+'''
+これは DeepSpeed ZeRO-3 の 初期化コンテキスト (zero.Init) を実装したクラスです。
+目的は「巨大モデルを効率的に初期化して、その場でパラメータを分割 (shard) する」ことです。
+'''
+# Replaces all parameters in module with Scattered Parameters
 class Init(InsertPostInitMethodToModuleSubClasses):
     param_id = 0
     
@@ -1181,7 +709,9 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             self._convert_to_deepspeed_param(param) #paramにフィールド・動的なメソッドをはやす
             param.partition()
     
-    #子モジュール直下のパラメータを ZeRO 分割管理に変換し、rank0 の値で揃えてシャーディング (post_init で 1 回だけ実行)
+    #各“子モジュール直下（recurse=False）のパラメータを ZeRO-3 用の分割管理（Scattered/ZeroParam）に変換し、
+    # rank0 の値でそろえてからシャーディングする処理です。
+    # 実行は post_init タイミング（＝その子モジュールの __init__ が完全に終わった直後）で1回だけ走ります。
     def _post_init_method(self, module):
         print_rank_0(f'Converting Params in {module.__class__.__name__}', force=False)
         see_memory_usage(
@@ -1212,8 +742,21 @@ class Init(InsertPostInitMethodToModuleSubClasses):
     def _convert_to_deepspeed_param(self, param):
         #このパラメータは ZeRO により分割（シャード）管理されることを示す種別タグ。将来 Normal/Remote 等と分岐させるための識別。
         param.ds_param_type = ZeroParamType.PARTITIONED
-        #ds_status はフル値の可用状態 (NOT_AVAILABLE→INFLIGHT→AVAILABLE)。shard しか持たない場合は
-        #フル値が無いので NOT_AVAILABLE (shard 側の状態は ds_tensor.status が別に持つ)
+        '''
+        ZeroParamStatus: 現在の可用状態。
+        AVAILABLE: その rank に **完全復元（all-gather 済み）**で手元にある状態
+        NOT_AVAILABLE: まだ完全には手元にない（分割の一部しかない/オフロード中など）
+        INFLIGHT: 通信などで「復元中」
+        '''
+        '''
+        GPU メモリに shard がないけど CPU にある、というケースについて
+        param.ds_status（全体状態）は NOT_AVAILABLE
+        → なぜなら「フルサイズのパラメータ」は CPU にも存在しない。持っているのは rank shard だけ。
+
+        param.ds_tensor.status（shard 状態）は AVAILABLE
+        → shard 自体は CPU メモリ上にあってアクセス可能。GPU 上にはないけど「NOT_AVAILABLE」ではない
+        '''
+         #パラメータ全体の可用状態。典型遷移は NOT_AVAILABLE（未復元/解放中）→ INFLIGHT（通信中）→ AVAILABLE（フル値が手元）。
         param.ds_status = ZeroParamStatus.AVAILABLE
 
         #元の完全テンソル形状（分割/パディング前の論理形状）。
@@ -1242,19 +785,11 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         param.ds_id = Init.param_id #Init.param_id: 付番用の グローバルな一意ID。各パラメータに ds_id として振る
         Init.param_id += 1
 
-        # P2: ds_id → param info マッピングに登録 (name は後で register_ag_param_names で埋める)
-        if param.ds_id not in _ds_id_info:
-            _ds_id_info[param.ds_id] = {
-                'name': '<unnamed>',
-                'shape': tuple(param.ds_shape),
-                'numel': int(param.ds_numel),
-                'dtype': str(param.dtype),
-            }
-        
-        param.cpu_full_param = None #CPUに全てのパラメータを保持する
-        param.cpu_full_param_pool = None #CPUのフルパラメータをプールしておく・ピン止め森のコストは高いのでこのfull_param_poolを利用してピン止めコストを減らす
-        
-        #all_gather 前: param.data は free 済み (担当分は ds_tensor)。all_gather 後: param.data がフルサイズ
+        '''
+        all_gather前後での引数paramについて
+        all_gather 前: param.data → freeされているのでアクセス不可(param.ds_tensorに自分の担当分のみ保存されている)
+        all_gather 後: param.data → 全 rank の shard を集めた「フルサイズ」テンソル。
+        '''
         def all_gather(param_list=None, async_op=False, hierarchy=0):
             cls = param
             if param_list is None:
@@ -1272,13 +807,6 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             params = sorted(params, key=lambda p: p.ds_id) #全 rank で同じ順序に並べ替え。coalesced ではフラットに連結して1回の通信をするため、順序が違うと取り違え事故になる。
             debug_rank0(f"-allgather_coalesced: {[p.ds_id for p in params]}")
 
-            # ENABLE_FULL_PARAM_TRANSFER=1 (デフォルト無効) かつ全 param が cpu_full_param を
-            # 持つ場合は通信せず CPU→GPU コピーだけで済ませる
-            if os.environ.get("ENABLE_FULL_PARAM_TRANSFER", "0") == "1" and \
-               all(getattr(p, "cpu_full_param", None) is not None for p in params):
-                t_request = time.perf_counter()
-                return CPUAllGatherCoalescedHandle(params, self.local_device, t_request=t_request)
-
             if len(params) == 1:
                 param, = params
                 param_buffer = torch.empty(
@@ -1292,8 +820,6 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                 input_flat = param.ds_tensor.contiguous().view(-1)
                 output_flat = param_buffer.contiguous().view(-1)
 
-                t_request = time.perf_counter()
-
                 # ★ DOCA 版 all_gather を async で起動
                 handle = _dist_allgather_fn(
                     input_flat=input_flat,
@@ -1304,7 +830,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
                 #先頭から実長分だけ切り出し、元形状に view、元デバイスへ to。.data で param のストレージを差し替え(param_bufferに対する操作がparam.dataに対する操作になる)
                 param.data = param_buffer.narrow(0, 0, param.ds_numel).view(param.ds_shape).to(param.device)
-                return AllGatherHandle(handle, param, t_request=t_request) #このhandleが実行されるとparamにフルサイズの重みパラメータが入る
+                return AllGatherHandle(handle, param) #このhandleが実行されるとparamにフルサイズの重みパラメータが入る
             else:
                 #params に入っているのは「自分の rank が担当しているシャード（＝ds_tensor）を持っているパラメータだけ」
                 partition_sz = sum(p.ds_tensor.ds_numel for p in params) #このランクが持つ全パラのシャード長の合計（連結後の 1ランク当たり長）
@@ -1329,8 +855,6 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                 # 乗せるため cid は最小 ds_id を代表値として用いる。
                 cid = min(p.ds_id for p in params)
 
-                t_request = time.perf_counter()
-
                 handle = _dist_allgather_fn(
                     input_flat = input_flat_cpu,
                     output_flat=flat_view,            # 全 rank 分が入るフラットバッファ
@@ -1343,7 +867,6 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                     params=params,
                     partitions=partitions,
                     world_size=self.world_size,
-                    t_request=t_request
                 ) #このhandleが実行されるとparamにフルサイズの重みパラメータが入る
                     
         def partition(param_list=None, hierarchy=0, has_been_updated=False):
@@ -1455,10 +978,8 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                     all_gather_list.append(param) #今自分のGPU上にあるならそのままall_gatherするリストに格納
         
         if not async_op:
-            if len(param_list) == 1: #1つだけ
-                ret_value = self._allgather_params(all_gather_list, hierarchy=hierarchy)
-            else:
-                ret_value = self._allgather_params_coalesced(all_gather_list, hierarchy) #同期的に行うときにしか出てこないよ~
+            # 呼び出し元は全て引数なしの param.all_gather() (単一パラメータ) のみ
+            ret_value = self._allgather_params(all_gather_list, hierarchy=hierarchy)
             for param in all_gather_list:
                 param.ds_status = ZeroParamStatus.AVAILABLE
             return ret_value
@@ -1477,7 +998,12 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         global reuse_buffers
         if param.ds_status is ZeroParamStatus.AVAILABLE: #フルサイズがすでにあるなら分割
             print_rank_0(f"Partitioning param id {param.ds_id} reuse buffers {reuse_buffers}", force=False)
-            #ds_tensor が既にあり値も未更新なら、フル側 (param.data) を解放するだけでよい
+            '''
+            すでに以前作った分割片（ds_tensor）が残っていて、かつ パラメータ値が直近で更新されていないなら、
+            フルの param.data を解放（free_param）。
+            ds_tensor はそのまま使えるので、ここで終了。
+            つまり「シャードはもうある・中身も最新 → フル側だけ捨てればOK」という最短経路
+            '''
             if param.ds_tensor is not None and not has_been_updated:
                 see_memory_usage(f'Before partitioning param {param.ds_id} {param.shape}', force=False)
                 free_param(param) #フルサイズのparamを開放して終わり
@@ -1512,8 +1038,6 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         see_memory_usage(f'Before partitioning param {param.ds_id} {param.shape}', force=False)
         free_param(param) #フルサイズparamの解放
         see_memory_usage(f'After partitioning param {param.ds_id} {param.shape}', force=False)
-        if dist.get_rank() == 0:
-            pass
 
     def _param_status(self, param):
         if param.ds_tensor is not None:
@@ -1535,7 +1059,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         see_memory_usage(f'After allocate allgather param {debug_param2name_id_shape_status(param)} {aligned_param_size} {partition_size} ', force=False)
         torch.cuda.synchronize() #単一プロセスでの同期, GPU kernelが終わるまではCPU実行を止める (torch.distributed.barrier()は複数プロセスのバリア同期)
         print_rank_0(f"{'--'* hierarchy}----allgather param with {debug_param2name_id_shape_status(param)} partition size={partition_size}")
-        # DOCA 版 flat all_gather を使用
+        # ===== ここを PyTorch → DOCA に差し替え =====
         input_tensor = param.ds_tensor
 
         handle = all_gather_flat_via_base(
@@ -1551,44 +1075,6 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         param.data = replicated_tensor.data
 
         return handle
-    
-    def _allgather_params_coalesced(self, param_list, hierarchy=0):
-        if len(param_list) == 0:
-            return
-        # collect local tensors and partition sizes
-        partition_sizes = []
-        local_tensors = []
-        for param in param_list:
-            partition_sizes.append(param.ds_tensor.ds_numel)
-            local_tensors.append(param.ds_tensor)
-        
-        allgather_params = []
-        for psize in partition_sizes:
-            tensor_size = psize * self.world_size #フルサイズテンソルのサイズ
-            flat_tensor = torch.empty(tensor_size, dtype=param_list[0].dtype, device=self.local_device).view(-1)
-            flat_tensor.requires_grad = False
-            allgather_params.append(flat_tensor)
-
-        # DOCA 版 all_gather_flat_via_base を使用
-        launch_handles = []
-        for param_idx, param in enumerate(param_list):
-            input_tensor = local_tensors[param_idx].view(-1)
-            h = all_gather_flat_via_base(
-                output_flat=allgather_params[param_idx],
-                input_flat=input_tensor,
-                cid=param.ds_id,
-                group=self.ds_process_group,
-                async_op=True,
-            )
-            launch_handles.append(h)
-        launch_handles[0].wait()
-
-        for i, param in enumerate(param_list):
-            gathered_tensor = allgather_params[i]
-            param.data = gathered_tensor.narrow(0, 0, param.ds_numel).view(param.ds_shape).data
-
-        torch.cuda.synchronize()
-        return None
 
     def _allgather_params(self, param_list, hierarchy=0): #param_listのものすべてを1D flat tensorにして一気にall_gather通信
         if len(param_list) == 0:
@@ -1609,7 +1095,8 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                     partitions[i].narrow(0, offset, param_numel).copy_(param.ds_tensor.data)
                     offset += param_numel
 
-        # DOCA 版 all_gather_list_via_base を使用 (collective ID は param_list[0].ds_id を代表値に)
+        # ===== ここを PyTorch dist.all_gather → DOCA all_gather_list_via_base に変更 =====
+        # collective ID は param_list[0].ds_id を代表として使う
         cid = param_list[0].ds_id
 
         all_gather_list_via_base(
@@ -1652,8 +1139,11 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             partition_size = param.ds_tensor.ds_numel
             start = self.rank * partition_size
             end = start + partition_size
-            #末尾以外の rank は出力が param.grad のビューに直書きされるためコピー不要。
-            #末尾 rank (start < ds_numel < end) はパディング用一時バッファに出力されるため有効要素だけ書き戻す
+            #末尾以外の rank では、_reduce_scatter_gradient 内で 入力スライスを param.grad の該当ビューとして渡しているため、
+            #**reduce_scatter の出力もそのビュー（= param.grad の一部）に“直書き”**される → コピー不要。
+            #末尾 rank だけは パディング分の都合で “一時バッファ”を入力に使うため、出力もそこに書き込まれる → 後で有効要素だけ param.grad へ書き戻す。
+            #start < param.ds_numel(全体サイズ) < end となっていると末尾が足りていない(paddingしたため)
+            #reduced_partitionには[自分rankの集約済みgradient]のみが入っているので0スタートelements個だけcopyすればいい
             if start < param.ds_numel and end > param.ds_numel:
                 elements = param.ds_numel - start
                 param.grad.view(-1).narrow(0, start, elements).copy_(reduced_partition.narrow(0,0,elements)) #reduce済み勾配をparamにコピーする(自分の担当分のみ)
@@ -1699,7 +1189,9 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         end = start + partition_size ##担当する勾配のstart, end
         dest_tensor_full_buffer = partition_buffer.view(-1).narrow(0, 0, partition_size) #出力先を 1D 化し、先頭 partition_size 分を「このランクの受け取り領域」としてビュー化
 
-        #実データが存在する要素数 elements を決定 (末尾パディングがあると elements < partition_size)
+        #このランクの開始位置が実データ範囲内なら、実データが存在する要素数 elements を決定
+        # （末尾パディングがあると elements < partition_size）。
+        #src_tensor＝フル勾配の該当スライス、dest_tensor＝出力先の該当スライス。
         if start < param.ds_numel:
             elements = min(param.ds_numel - start, partition_size)
             dest_tensor = dest_tensor_full_buffer.narrow(0, 0, elements)

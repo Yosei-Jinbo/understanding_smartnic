@@ -2,7 +2,6 @@ import sys
 import os
 import argparse
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from common.utils import SynchronizedWallClockTimer
 
 import torch
 import torch.distributed as dist
@@ -165,7 +164,6 @@ class ZeroWrapperExample(Module):
         
         if model_parameters or optimizer:
             self._configure_optimizer(optimizer, model_parameters)
-        #optimizerは必ず引数として与えるようにする!!!
 
         self._get_model_parameters()
         
@@ -194,7 +192,8 @@ class ZeroWrapperExample(Module):
 
             logging.info(f"Set device to local rank {self.local_rank} within node.")
 
-            # データ並列グループは PyTorch 既定の WORLD を採用
+            # ★ データ並列グループとサイズ（PyTorch 既定の WORLD を採用）
+            #    独自のサブグループを作らない限り、WORLD を “DP グループ” として扱って問題ありません。
             self.data_parallel_group = dist.group.WORLD if dist.is_initialized() else None
             self.dp_world_size = self.world_size
 
@@ -230,18 +229,19 @@ class ZeroWrapperExample(Module):
     def _configure_distributed_model(self, model):
         self._set_client_model(model)
         #model parameterのtype調整はDeepSpeed外で行う, ただし、ZeRO Optimizerのcommunication typeに注意!!!
-        self.module.to(self.device) #ここもOffloadを実装するときには変えてね
+        self.module.to(self.device)
         #ampの確認が必要だが、bf16では基本的に利用しないので本家とは違いチェックはしない
         self._broadcast_model()
         
     def _get_model_parameters(self):
-        #DeepSpeed autotuning 用の関数。本実装では利用しないので pass
+        #auto tuining用の関数、DeepSpeed の autotuning は、与えたモデル／クラスタ条件で実行が安定して速くなる構成を自動探索するための仕組み
+        #今回の実装では利用しないのでそのままpassにしている
         pass
     
     #Optimizer に渡した param_groups の中に、同じ Parameter が重複登録されていないかを検査して止める関数
     def _check_for_duplicates(self, optimizer):
         for name, param in self.module.named_parameters():
-            param_id = id(param)
+            param_id = id(param) #id(param) は Python 組み込み関数 id() で、そのオブジェクト（ここでは param）の 同一性（identity）を表す整数を返します
             
             def ids_list(group):
                 return [id(param) for param in group]
@@ -254,6 +254,7 @@ class ZeroWrapperExample(Module):
             assert occurrence <= 1, f"Parameter with name: {name} occurs multiple times in optimizer.param_groups. Make sure it only appears once to prevent undefined behaviour."
     
     def _configure_zero_optimizer(self, optimizer):
+        #timers = self.timers if self.wall_clock_breakdown() else None
         timers = None
         self.contiguous_gradients = True
         self.reduce_bucket_size: int = self._reduce_bucket_size
@@ -297,6 +298,7 @@ class ZeroWrapperExample(Module):
         if self.zero_optimization():
             self.optimizer = self._configure_zero_optimizer(basic_optimizer)
 
+
     def train(self):
         self.module.train()
     
@@ -308,13 +310,14 @@ class ZeroWrapperExample(Module):
         for module in self.module.modules():
             module._parameters._in_forward = True
             pass
-
+        
         loss = self.module(*inputs, **kwargs)
-
+        
         for module in self.module.modules():
             module._parameters._in_forward = False
 
-        # Profile-only (NSYS_SYNC_RANGES=1): forward NVTX range を全カーネル完了まで開けておく
+        # Profile-only: keep :ZeroWrapperExample.forward NVTX range open until
+        # all forward kernels finish (pair with backward's sync for symmetry).
         if os.environ.get("NSYS_SYNC_RANGES", "0") == "1":
             torch.cuda.synchronize()
 
@@ -356,8 +359,10 @@ class ZeroWrapperExample(Module):
                  release_loss=False,
                  retain_graph=False,
                  scale_wrt_gas=True):
-        #ZeRO Stage3 では backward 中の reduce は計算グラフ上のフックで発火する
-
+        #release_loss: lossの参照や関連バッファ情報をfreeする, allreduce_gradients: 終了後に勾配をallreduceする, retain_graph: 計算グラフを破棄する
+        #ZeRO Stage3ではbackwardでのallreduceは計算グラフ上で発火するようにしているので今はいらない
+        #scale_wrt_gas: lossをgradient_acculumation_stepで割る、lossを平均に戻す操作
+        
         # scale loss w.r.t. gradient accumulation if needed
         if self.gradient_accumulation_steps > 1 and scale_wrt_gas:
             loss = self._scale_loss_by_gas(loss.float())
@@ -369,8 +374,10 @@ class ZeroWrapperExample(Module):
             # Traditional code path that allreduces the module parameter grads
             self.allreduce_gradients()
 
-        # Profile-only (NSYS_SYNC_RANGES=1): backward NVTX range を GPU 完了まで開けておく
-        # (GPU flag wait 使用時は Python が GPU より先に return するため nsys の帰属が曖昧になる)
+        # Profile-only: force the :ZeroWrapperExample.backward NVTX range to stay open
+        # until all enqueued backward kernels are complete on the GPU. Without this,
+        # The gpu-flag AG path makes Python return before GPU finishes, so nsys attributes the
+        # backward compute kernels to a different/ambiguous range.
         if os.environ.get("NSYS_SYNC_RANGES", "0") == "1":
             torch.cuda.synchronize()
 
@@ -381,14 +388,15 @@ class ZeroWrapperExample(Module):
         self.optimizer.step()
         self.optimizer.zero_grad() #パラメータ更新用の処理をしてからgradをNoneにしているので関係ない
         self.global_steps += 1
-    
+
     def step(self, lr_kwargs=None):
+        """通常経路 (非 DPU): 同期的に CPU Adam を実行し、同一 step 内で反映する。"""
         if self.is_gradient_accumulation_boundary():
             self.gas_boundary_ctr += 1
             self._take_model_step(lr_kwargs)
 
         self.micro_steps += 1
-        
+
     def _take_model_step_dpu(self, lr_kwargs, block_eigenvalue={}):
         self.optimizer.step_dpu(first_step = (self.dpu_steps == 0)) #DPUで初めのステップはパラメータ更新のための勾配がないのでパラメータ更新はせずに捨てる
         self.optimizer.zero_grad() #パラメータ更新用の処理をしてからgradをNoneにしているので関係ない
@@ -396,16 +404,16 @@ class ZeroWrapperExample(Module):
         self.dpu_steps += 1
             
     def step_dpu(self, lr_kwargs=None):
+        #self._start_timers(self.engine_timers.step_timers)
         self.is_boundary = False
         if self.is_gradient_accumulation_boundary():
             self.gas_boundary_ctr += 1
             self.is_boundary = True
             self._take_model_step_dpu(lr_kwargs)
-
+        
         self.micro_steps += 1
         return self.is_boundary
-        
-    
+
     def start_adam_process(self, cpu_affinity=None):
         self.optimizer.start_adam_process(cpu_affinity)
 

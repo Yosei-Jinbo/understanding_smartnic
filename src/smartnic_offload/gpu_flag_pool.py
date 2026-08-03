@@ -1,32 +1,45 @@
 """Completion flag pool — int32 array used as DPU→host completion flags.
 
-各 AG は slot を取得して (host_addr, generation) を DPU に送り、consumer stream に
-cuStreamWaitValue32(EQ, generation) を積む。AG 完了時に DPU が RDMA Write で
-generation を書き込み、待ちが解ける。generation は slot ごとに単調増加なので
-stale/future な flag write と誤マッチしない。
-DPU が GPU メモリへ書くため host mmap は DOCA_ACCESS_FLAG_PCI_READ_WRITE
-(Cross-GVMI) が必要。USE_GPU_FLAG_POOL_PCI=0 で pinned host memory に切替。
+Each AG request acquires a slot, gets a unique generation value, and:
+  - sends (host_addr, generation) to DPU as part of the cmd
+  - schedules cuStreamWaitValue32(EQ, generation) on the consumer compute stream
+
+After the AG completes, DPU writes `generation` to the slot via RDMA Write
+(before the doorbell). The compute stream's wait then unblocks, and downstream
+kernels execute. The Python thread never blocks in wait().
+
+Memory placement: **pinned host memory** (fixed).
+  - CUDA UVA makes data_ptr() valid as a device pointer, so
+    cuStreamWaitValue32 can wait on it from the GPU.
+  - The DPU writes it via the ordinary RDMA rkey path (same as the doorbell).
+  - Being host memory, Python can also read the flags cheaply — used to decide
+    when enqueue-time keep_alive buffers can be released (see
+    partition_parameters._sweep_flag_keepalive).
+
+Slot recycling:
+  - Pool size POOL_SIZE (default 4096) >> peak in-flight AGs (~32)
+  - Slots are reused round-robin
+  - Each reuse increments the slot's generation, so the (slot_id, gen) pair is
+    unique across the lifetime of training. cuStreamWaitValue(EQ, gen) for an
+    OLD generation is fine because by the time a slot is reused, the GPU has
+    already consumed the old AG result.
+
+Why generation as the value (not 1):
+  - Each AG using the same slot must have a UNIQUE wait value to avoid the
+    consumer stream matching a stale/future flag write.
+  - generation is monotonic and unique per slot.
 """
 
 from __future__ import annotations
 
-import os
 import threading
 from typing import Tuple
 
 import torch
 
 
-def _use_gpu_memory() -> bool:
-    """USE_GPU_FLAG_POOL_PCI=0 で pinned host memory に切替 (デフォルトは GPU memory)。"""
-    v = os.environ.get("USE_GPU_FLAG_POOL_PCI", "1")
-    return v != "0"
-
-
 class GpuFlagPool:
-    """int32 completion flag pool. GPU device memory 上に置き、DPU は Cross-GVMI
-    (doca_mmap_export_pci) 経由で書き込む。USE_GPU_FLAG_POOL_PCI=0 で pinned host に切替。
-    """
+    """int32 completion flags (pinned host memory, POOL_SIZE entries)."""
 
     def __init__(self, device: torch.device, size: int = 4096):
         if size <= 0 or (size & (size - 1)) != 0:
@@ -34,20 +47,12 @@ class GpuFlagPool:
         self._device = device
         self._size = size
         self._mask = size - 1
-        self._use_gpu = _use_gpu_memory()
-        if self._use_gpu:
-            self._flags = torch.zeros(size, dtype=torch.int32, device=device)
-        else:
-            # fallback: pinned host memory (UVA accessible from device)
-            self._flags = torch.zeros(size, dtype=torch.int32, pin_memory=True)
+        # pinned host memory (UVA accessible from device)
+        self._flags = torch.zeros(size, dtype=torch.int32, pin_memory=True)
         self._base_addr = self._flags.data_ptr()
         self._gens = [0] * size  # per-slot monotonic generation counter
         self._next = 0
         self._lock = threading.Lock()
-
-    @property
-    def is_gpu_memory(self) -> bool:
-        return self._use_gpu
 
     @property
     def size(self) -> int:
@@ -68,8 +73,12 @@ class GpuFlagPool:
     def acquire(self) -> Tuple[int, int, int, int]:
         """Acquire the next slot.
 
-        Returns (slot_id, generation, gpu_addr, expected_value);
-        expected_value == generation (slot ごとの単調カウンタ)。
+        Returns:
+            (slot_id, generation, flag_addr, expected_value)
+            - slot_id: index in [0, size)
+            - generation: monotonic counter for this slot (also = expected_value)
+            - flag_addr: address of the int32 slot (pinned host; UVA device ptr)
+            - expected_value: value to wait for (== generation)
         """
         with self._lock:
             slot_id = self._next
@@ -78,17 +87,13 @@ class GpuFlagPool:
             gen = self._gens[slot_id]
         if gen >= (1 << 30):
             raise OverflowError(f"slot {slot_id} generation overflow at {gen}")
-        gpu_addr = self._base_addr + slot_id * 4
-        return slot_id, gen, gpu_addr, gen
+        flag_addr = self._base_addr + slot_id * 4
+        return slot_id, gen, flag_addr, gen
 
-    def reset(self) -> None:
-        """Reset all flags/generations. outstanding wait が残っていると永久待ちに
-        なるため、待ちが無いときのみ呼ぶこと。
-        """
-        with self._lock:
-            self._flags.zero_()
-            self._gens = [0] * self._size
-            self._next = 0
+    def flag_reached(self, slot_id: int, gen: int) -> bool:
+        """slot の flag が gen 以上か (= その AG の DPU 側処理が完了済みか)。
+        pinned host memory の読みなので GPU 同期なしで安価。"""
+        return int(self._flags[slot_id]) >= gen
 
 
 # Global singleton (set by run_zero.py at startup)

@@ -581,10 +581,9 @@ def run_zero(use_profiler=False, use_bf16=False, use_ema=False,
             WARMUP_STEPS = int(os.environ.get("TIMING_WARMUP_STEPS", "5"))
             epochs = num_epochs if num_epochs is not None else 5
 
-        # ZeRO-Offload (既定): 全エポック DPU (delayed parameter update) 経路
-        # (CPU Adam worker + 遅延1step更新)。このエポック以下は正常経路、超えたら DPU 経路。
-        # テスト用に環境変数で上書き可能 (例: DPU_THRESHOLD=10**9 で全エポック通常経路)。
-        dpu_threshold = int(os.environ.get("DPU_THRESHOLD", "-1"))
+        # このエポック以下は正常経路 (同期 step)、超えたら DPU (delayed parameter update) 経路。
+        # 既定 10**9 = 全エポック通常経路。環境変数で上書き可能 (例: DPU_THRESHOLD=-1 で全エポック DPU)。
+        dpu_threshold = int(os.environ.get("DPU_THRESHOLD", "1000000000"))
         if no_offload:
             # 純粋 ZeRO-3 (GPU) モード: CPU Adam worker がないため DPU は使えない。
             if "DPU_THRESHOLD" in os.environ:

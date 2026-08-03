@@ -1,6 +1,13 @@
-"""mpirun 用ランチャ。mpi4py で rank/world_size を取得し、torch.distributed が
-期待する環境変数 (RANK, WORLD_SIZE, LOCAL_RANK, MASTER_ADDR, MASTER_PORT) を
-セットしてから run_zero.run_zero() を呼ぶ。
+# run_zero_mpi.py
+"""
+mpirun 用ランチャ
+
+- mpirun + mpi4py で rank / world_size を取得
+- それを torch.distributed が期待する環境変数
+  (RANK, WORLD_SIZE, LOCAL_RANK, MASTER_ADDR, MASTER_PORT)
+  に詰めてから、元の run_zero.run_zero() を呼び出す。
+
+元の run_zero.py は torchrun 前提のままで OK。
 """
 
 import os
@@ -16,10 +23,9 @@ COMCH_HOST_DIR = THIS_DIR / "comch_mpi" / "host"
 sys.path.insert(0, str(COMCH_HOST_DIR))
 
 import doca_comch_client_pybind
-from doca_comch_client_pybind import CollectiveCommunication
 
-from mpi4py import MPI
-import run_zero
+from mpi4py import MPI  # mpirun でランク情報を取る
+import run_zero  # 同じディレクトリの run_zero.py をインポート
 
 
 def setup_env_from_mpi(master_addr=None, master_port=None):
@@ -31,7 +37,8 @@ def setup_env_from_mpi(master_addr=None, master_port=None):
     rank = comm.Get_rank()
     world_size = comm.Get_size()
 
-    # 単ノード or 各ノード同数 GPU 前提
+    # 単ノード or 各ノード同数 GPU 前提:
+    # local_rank は「GPU 枚数で割った余り」にする
     local_rank = rank
     try:
         import torch
@@ -43,10 +50,15 @@ def setup_env_from_mpi(master_addr=None, master_port=None):
         # torch がまだ使えない環境でも一応動くようにしておく
         pass
 
+    # torchrun が渡してくれるはずの環境変数を、自分で埋める
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["LOCAL_RANK"] = str(local_rank)
 
+    # MASTER_ADDR / MASTER_PORT は優先順位:
+    #   1) 関数引数 (CLI で渡した値)
+    #   2) すでに環境変数に入っている値
+    #   3) デフォルト値
     if master_addr is not None:
         os.environ["MASTER_ADDR"] = master_addr
     else:
@@ -56,8 +68,6 @@ def setup_env_from_mpi(master_addr=None, master_port=None):
         os.environ["MASTER_PORT"] = str(master_port)
     else:
         os.environ.setdefault("MASTER_PORT", "29500")
-
-    return rank, world_size, local_rank
 
 
 def main():
@@ -71,8 +81,6 @@ def main():
         action="store_true",
         help="Enable profiler (run_zero.py の引数と同じ)",
     )
-    parser.add_argument("--bf16", action="store_true")
-    parser.add_argument("--ema", action="store_true")
     parser.add_argument(
         "--master_addr",
         type=str,
@@ -97,19 +105,17 @@ def main():
     parser.add_argument("--prefetch-bucket-size", type=float, default=1e8)
     parser.add_argument("--max-reuse-distance", type=float, default=0)
     parser.add_argument("--max-live-parameters", type=float, default=1.5e8)
+    parser.add_argument("--eval-accuracy", action="store_true",
+                        help="各エポック後に test_loader で accuracy を評価する "
+                             "(--epochs と併用。--measure-iters 指定時は途中打ち切りで評価に到達しない)")
     args = parser.parse_args()
 
-    rank, world_size, local_rank = setup_env_from_mpi(
+    # ここで MPI から env を準備 (RANK/WORLD_SIZE/LOCAL_RANK は os.environ 経由で伝わる)
+    setup_env_from_mpi(
         master_addr=args.master_addr,
         master_port=args.master_port,
     )
-    
-    comm = MPI.COMM_WORLD
-    rank = comm.Get_rank()
-    world_size = comm.Get_size()
-    process_per_node = 2
-    local_rank = rank % process_per_node
-    
+
     # mpirun --bind-to core がプロセスを1コアに制限している場合、
     # 全コアにアクセスできるように解除する (run_zero.py が NUMA-aware に再配分)
     try:
@@ -127,10 +133,9 @@ def main():
         from common import debug_params as dbg
         dbg.enable()
 
+    # あとは元の run_zero の学習本体をそのまま呼ぶだけ
     run_zero.run_zero(
         use_profiler=args.profiler,
-        use_bf16=args.bf16,
-        use_ema=args.ema,
         model_name=args.model,
         dataset_name=args.dataset,
         batch_size=args.batch_size,
@@ -142,6 +147,7 @@ def main():
         prefetch_bucket_size=int(args.prefetch_bucket_size),
         max_reuse_distance=int(args.max_reuse_distance),
         max_live_parameters=int(args.max_live_parameters),
+        eval_accuracy=args.eval_accuracy,
     )
 
 

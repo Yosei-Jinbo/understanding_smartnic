@@ -6,7 +6,6 @@ from common.utils import logger
 import torch
 import torch.distributed as dist
 import gc
-import time
 import collections
 from typing import Deque, Dict, Tuple
 from torch.cuda import Event, Stream
@@ -37,86 +36,10 @@ sys.path.insert(0, str(COMCH_HOST_DIR))
 import doca_comch_client_pybind
 from doca_comch_client_pybind import CollectiveCommunication
 
-# 転送内訳計測用 NVTX (XFER_NVTX=1 で有効)。'xfer:*' 区間は
-# scripts/extract_transfer_per_step.py が参照。USE_NVTX_RANGES とは独立にゲート。
-_XFER_NVTX = os.environ.get("XFER_NVTX", "0") == "1"
-
-
-def _xfer_push(label: str) -> None:
-    if _XFER_NVTX:
-        torch.cuda.nvtx.range_push(label)
-
-
-def _xfer_pop() -> None:
-    if _XFER_NVTX:
-        torch.cuda.nvtx.range_pop()
-
-
-
-# ---- grad D2H offload の GPU 時間集計 (CUDA event based, per-rank ms) ----
-GRAD_OFFLOAD_D2H_TIME_MS: float = 0.0
-GRAD_OFFLOAD_D2H_CALLS: int = 0
-
-def _accumulate_grad_offload_d2h_time_ms(delta_ms: float) -> None:
-    global GRAD_OFFLOAD_D2H_TIME_MS, GRAD_OFFLOAD_D2H_CALLS
-    GRAD_OFFLOAD_D2H_TIME_MS += float(delta_ms)
-    GRAD_OFFLOAD_D2H_CALLS += 1
-
-def get_grad_offload_d2h_time_ms() -> float:
-    return float(GRAD_OFFLOAD_D2H_TIME_MS)
-
-def get_grad_offload_d2h_calls() -> int:
-    return int(GRAD_OFFLOAD_D2H_CALLS)
-
-# ---- reduce_scatter の通信時間集計 (CUDA event based, per-rank ms) ----
-REDUCE_SCATTER_TIME_MS: float = 0.0
-REDUCE_SCATTER_CALLS: int = 0
-
-def _accumulate_reduce_scatter_time_ms(delta_ms: float) -> None:
-    global REDUCE_SCATTER_TIME_MS, REDUCE_SCATTER_CALLS
-    REDUCE_SCATTER_TIME_MS += float(delta_ms)
-    REDUCE_SCATTER_CALLS += 1
-
-def get_reduce_scatter_time_ms() -> float:
-    return float(REDUCE_SCATTER_TIME_MS)
-
-def get_reduce_scatter_calls() -> int:
-    return int(REDUCE_SCATTER_CALLS)
-
-# ---- Per-RS detailed records ----
-_RS_RECORDS: list = []  # [(nbytes, total_ms, enqueue_ms, wait_ms)]
-
-def _record_rs_detail(nbytes: int, total_ms: float, enqueue_ms: float, wait_ms: float) -> None:
-    _RS_RECORDS.append((nbytes, total_ms, enqueue_ms, wait_ms))
-
-def print_rs_analysis(epoch: int) -> None:
-    """Print per-RS analysis at epoch end."""
-    records = list(_RS_RECORDS)
-    if not records:
-        return
-    n = len(records)
-    total_ms_all = sum(t for _, t, _, _ in records)
-    avg_total = total_ms_all / n
-    avg_enq = sum(e for _, _, e, _ in records) / n
-    avg_wait = sum(w for _, _, _, w in records) / n
-    avg_sz = sum(s for s, _, _, _ in records) / n
-    sorted_total = sorted(t for _, t, _, _ in records)
-    p50 = sorted_total[n // 2]
-    p99 = sorted_total[int(n * 0.99)] if n > 1 else sorted_total[0]
-    print(f"========== Per-RS Analysis (Epoch {epoch}) ==========", flush=True)
-    print(f"  RS calls: {n} | total: {total_ms_all/1000:.1f}s", flush=True)
-    print(f"  Per-RS: avg={avg_total:.3f}ms | p50={p50:.3f}ms | p99={p99:.3f}ms", flush=True)
-    print(f"  Avg size: {avg_sz/1024/1024:.1f}MB", flush=True)
-    print(f"  Enqueue overhead: avg={avg_enq:.3f}ms", flush=True)
-    print(f"  Wait (DPU + completion): avg={avg_wait:.3f}ms", flush=True)
-    print(f"{'=' * 55}", flush=True)
-
-def reset_rs_records() -> None:
-    _RS_RECORDS.clear()
-
 def print_rank_0(message, debug=False, force=False):
     rank = dist.get_rank()
     if rank == 0 and (debug or force):
+        #print(message)
         pass
     
 def _flatten(tensors):
@@ -124,49 +47,26 @@ def _flatten(tensors):
     ts = [t.detach().contiguous() for t in tensors]
     return _flatten_dense_tensors(ts)
 
-def _unflatten(flat, like_tensors):
-    # like_tensors の shape に合わせて view を作る
-    return _unflatten_dense_tensors(flat, [t.detach().contiguous() for t in like_tensors])
-
-
-def _scatter_flat_to_list(
-    flat_output: torch.Tensor,
-    output_tensors: List[torch.Tensor],
-    like_tensor: torch.Tensor,
-) -> None:
-    world_size = len(output_tensors)
-    numel_per_rank = like_tensor.numel()
-
-    flat_2d = flat_output.view(world_size, numel_per_rank)
-
-    for rank, out in enumerate(output_tensors):
-        out.copy_(flat_2d[rank].view_as(out))
-
 class _ComchHandleWork:
     """
     C 側の handle を保持して wait/test/release する Work。
+    keep_alive: enqueue した src テンソル等を doorbell 完了 (=wait()) まで保持する
     """
-    def __init__(self, handle: int) -> None:
+    def __init__(self, handle: int, keep_alive=None) -> None:
         self._handle = int(handle)
         self._released = False
         self._completed = False
+        self._keep_alive = keep_alive
 
     def wait(self):
         if not self._completed:
             doca_comch_client_pybind.comch_req_wait_py(self._handle)
             self._completed = True
+            self._keep_alive = None  # DPU 読了済み。バッファを解放してよい
         if not self._released:
             doca_comch_client_pybind.comch_req_release_py(self._handle)
             self._released = True
         return None
-
-    def is_completed(self) -> bool:
-        if self._completed:
-            return True
-        done = doca_comch_client_pybind.comch_req_test_py(self._handle)
-        if done:
-            self._completed = True
-        return done
 
     def __del__(self):
         # wait() せずに破棄された場合でもリークしないように release
@@ -176,64 +76,6 @@ class _ComchHandleWork:
             except Exception:
                 pass
             self._released = True
-
-def _scatter_flat_to_list(
-    flat_output: torch.Tensor,
-    output_tensors: List[torch.Tensor],
-    like_tensor: torch.Tensor,
-) -> None:
-    world_size = len(output_tensors)
-    numel_per_rank = like_tensor.numel()
-
-    flat_2d = flat_output.view(world_size, numel_per_rank)
-
-    for rank, out in enumerate(output_tensors):
-        out.copy_(flat_2d[rank].view_as(out))
-
-    
-# =========================
-# リスト版 ReduceScatter
-# =========================
-def reduce_scatter_list_via_base(
-    output_tensor: torch.Tensor,
-    input_tensors: List[torch.Tensor],
-    cid: int,
-    group: Optional[dist.ProcessGroup] = None,
-    async_op: bool = False,
-):
-    world_size = dist.get_world_size()
-
-    if len(input_tensors) != world_size:
-        raise ValueError(f"len(input_tensors)={len(input_tensors)} must equal world_size={world_size}")
-
-    out_numel = output_tensor.numel()
-
-    flat_list = [t.contiguous().view(-1) for t in input_tensors]
-    input_flat = torch.cat(flat_list, dim=0).contiguous()
-
-    output_flat = torch.empty(out_numel, dtype=output_tensor.dtype, device=output_tensor.device).contiguous()
-
-    handle = doca_comch_client_pybind.ucp_collective_enqueue_py(
-        cid, input_flat, output_flat, CollectiveCommunication.REDUCE_SCATTER
-    )
-
-    class _ReduceScatterHandleWork(_ComchHandleWork):
-        def __init__(self, h, out_flat, out_t):
-            super().__init__(h)
-            self._out_flat = out_flat
-            self._out_t = out_t
-
-        def wait(self):
-            super().wait()
-            self._out_t.copy_(self._out_flat.view_as(self._out_t))
-            return None
-
-    if not async_op:
-        w = _ReduceScatterHandleWork(handle, output_flat, output_tensor)
-        w.wait()
-        return None
-    else:
-        return _ReduceScatterHandleWork(handle, output_flat, output_tensor)
 
 # =========================
 # フラット版 ReduceScatter
@@ -253,12 +95,15 @@ def reduce_scatter_flat_via_base(
     handle = doca_comch_client_pybind.ucp_collective_enqueue_py(
         cid, in_view, out_view, CollectiveCommunication.REDUCE_SCATTER
     )
+    # in_view を doorbell 完了まで保持 (src が一時バッファの場合、参照を切らすと
+    # DPU 読み取り前にアロケータが再利用する use-after-free になる)
     if not async_op:
-        w = _ComchHandleWork(handle)
+        w = _ComchHandleWork(handle, keep_alive=(in_view,))
         w.wait()
         return None
     else:
-        return _ComchHandleWork(handle)
+        return _ComchHandleWork(handle, keep_alive=(in_view,))
+
 
 #複数のテンソルをまとめて reduce-scatter（勾配の平均＋分割）するための高効率ユーティリティ関数
 @instrument_w_nvtx
@@ -272,12 +117,16 @@ def reduce_scatter_coalesced(
     this_rank = dist.get_rank(group)
     world_sz = dist.get_world_size(group)
     
-    # partition_lst_for_each_tensor[tensor_idx][rank] = tensor_idx の rank 用チャンク
-    # (1D flatten して ceil サイズで分割、不足分は後でパディング)
     partition_lst_for_each_tensor = [None] * len(tensors)
+    '''
+    各テンソルを 1D に flatten。
+    各テンソルを world_sz 個のチャンクに切り出す。割り切れないときは ceil で切り上げたサイズを使う（＝後で パディングが必要）。
+    結果は partition_lst_for_each_tensor[tensor_idx][rank] で「tensor_idx のテンソルの rank 用チャンク」にアクセスできる。
+    '''
     for tensor_idx, tensor in enumerate(tensors):
-        flattened_tensor = tensor.view(-1)
-        chunk_sz = math.ceil(tensor.numel() / world_sz)
+        flattened_tensor = tensor.view(-1) #flat化
+        chunk_sz = math.ceil(tensor.numel() / world_sz) #1ランクあたりの目標チャンクサイズを計算(割り切れないときは切り上げ) → 不足分は後でパディング。
+        #flat化したtensorをそれぞれのrankが担当する分に分けてリストとして保存しておく
         partition_lst_for_each_tensor[tensor_idx] = [flattened_tensor[rank*chunk_sz : (rank+1)*chunk_sz] for rank in range(0, world_sz)]
     
     padded_partition_sz_for_each_tensor = tuple(math.ceil(t.numel() / world_sz) for t in tensors) #padding
@@ -330,92 +179,69 @@ def reduce_scatter_coalesced(
     from common import debug_params as dbg
     dbg.log_reduce_scatter(tensor_partition_flat_buffer, None, sub_group_id="flat_input")
 
-    t_rs_start = time.perf_counter()
-
+    submit_fn = None
+    src_ready_ev = None
     if _rs_use_nccl:
         # NCCL reduce_scatter (同期)
         input_chunks = list(torch.chunk(tensor_partition_flat_buffer, world_sz, dim=0))
-        # sync NCCL RS は _DeferredRsResult.wait() の bracket が発火しないため、ここで stall 計測
-        try:
-            from common import stall_event_tracker as _set_rs  # type: ignore
-        except Exception:
-            _set_rs = None
-        if _set_rs is not None and _set_rs.is_enabled():
-            try:
-                from partition_parameters import _AG_PHASE as _PHASE_RS  # type: ignore
-            except Exception:
-                _PHASE_RS = "unknown"
-            _tr_rs = _set_rs.get_global()
-            _stream_rs = torch.cuda.current_stream()
-            _rs_nbytes_inline = int(tensor_partition_flat_buffer.numel() *
-                                     tensor_partition_flat_buffer.element_size())
-            _h_rs = _tr_rs.begin(_stream_rs, _PHASE_RS, op="rs",
-                                  ds_id=-1, payload_bytes=_rs_nbytes_inline)
-            try:
-                dist.reduce_scatter(output_flat, input_chunks, op=dist.ReduceOp.SUM, group=group)
-            finally:
-                _tr_rs.end(_h_rs)
-        else:
-            dist.reduce_scatter(output_flat, input_chunks, op=dist.ReduceOp.SUM, group=group)
+        dist.reduce_scatter(output_flat, input_chunks, op=dist.ReduceOp.SUM, group=group)
         rs_handle = None
     else:
-        # DOCA 版フラット reduce_scatter を非同期で発行
-        rs_handle = reduce_scatter_flat_via_base(
-            output_flat,
-            tensor_partition_flat_buffer,
-            cid=cid,
-            group=group,
-            async_op=True,
-        )
+        # DOCA 版: src (cat + div_ の結果) は CUDA stream 上の非同期カーネルが書くが、
+        # DPU の RDMA read は CUDA stream の順序保証の外にあるため、カーネル完了前に
+        # enqueue すると DPU が計算前の内容を読む (NCCL RS は stream 順序で守られる)。
+        # CPU をブロックしないよう、event を record して submit を遅延する:
+        # 以後の maybe_submit() (勾配フック毎) で event.query() が立ったら enqueue、
+        # wait() が先に来た場合のみ event を待ってから enqueue する。
+        rs_handle = None
+        src_ready_ev = Event()
+        src_ready_ev.record()
+        _src = tensor_partition_flat_buffer  # submit まで src への参照を保持
 
-    t_rs_enqueued = time.perf_counter()
+        def submit_fn(_out=output_flat, _in=_src, _cid=cid, _group=group):
+            return reduce_scatter_flat_via_base(
+                _out, _in, cid=_cid, group=_group, async_op=True)
 
     # RS handle を返す (呼び出し元が wait タイミングを制御)
     class _DeferredRsResult:
-        """RS handle + 計測情報を保持。wait() で完了を待ち、出力テンソルを返す。"""
-        def __init__(self, handle, output_flat, output_lst, t_start, t_enqueued, nbytes):
+        """DOCA RS の submit (src ready 後) と wait を保持する。
+        maybe_submit() は非ブロッキング: src を書く CUDA カーネルが完了していれば
+        その場で DPU へ enqueue する。wait() は未 submit なら event を待って submit
+        してから完了をブロック待ちする。in-flight は常に 1 個 (_pending_rs) なので
+        遅延 submit でも rank 間の発行順序は保たれる。"""
+        def __init__(self, handle, output_flat, output_lst, submit_fn=None, src_ready_ev=None):
             self._handle = handle
             self.output_flat = output_flat
             self.output_lst = output_lst
-            self._t_start = t_start
-            self._t_enqueued = t_enqueued
-            self._nbytes = nbytes
             self._waited = False
+            self._submit_fn = submit_fn
+            self._src_ready_ev = src_ready_ev
+
+        def maybe_submit(self):
+            if self._submit_fn is not None and self._src_ready_ev.query():
+                self._handle = self._submit_fn()
+                self._submit_fn = None
+
+        def force_submit(self):
+            """未 submit なら src ready を待って必ず submit する。
+            別 collective (AG) の enqueue 直前に呼ばれ、全 rank の発行順序を
+            決定論的に揃える (event 待ちは通常ゼロ〜サブ ms)。DPU が RS/AG を
+            単一 msg_pool で直列実行するため、順序一致は必須 (ズレるとデッドロック)。"""
+            if self._submit_fn is not None:
+                self._src_ready_ev.synchronize()
+                self._handle = self._submit_fn()
+                self._submit_fn = None
 
         def wait(self):
             if self._waited:
                 return self.output_lst
+            self.force_submit()
             if self._handle is not None:
                 torch.cuda.nvtx.range_push("rs_wait")
                 try:
-                    # bracket the actual stream wait op for stall measurement
-                    try:
-                        from common import stall_event_tracker as _set  # type: ignore
-                    except Exception:
-                        _set = None
-                    if _set is not None and _set.is_enabled():
-                        try:
-                            from partition_parameters import _AG_PHASE as _PHASE  # type: ignore
-                        except Exception:
-                            _PHASE = "unknown"
-                        tracker = _set.get_global()
-                        stream = torch.cuda.current_stream()
-                        h = tracker.begin(stream, _PHASE, op="rs",
-                                          ds_id=-1, payload_bytes=int(self._nbytes))
-                        try:
-                            self._handle.wait()
-                        finally:
-                            tracker.end(h)
-                    else:
-                        self._handle.wait()
+                    self._handle.wait()
                 finally:
                     torch.cuda.nvtx.range_pop()
-            t_rs_end = time.perf_counter()
-            total_ms = (t_rs_end - self._t_start) * 1000.0
-            enqueue_ms = (self._t_enqueued - self._t_start) * 1000.0
-            wait_ms = (t_rs_end - self._t_enqueued) * 1000.0
-            _accumulate_reduce_scatter_time_ms(total_ms)
-            _record_rs_detail(self._nbytes, total_ms, enqueue_ms, wait_ms)
             self._waited = True
             return self.output_lst
 
@@ -430,12 +256,9 @@ def reduce_scatter_coalesced(
 
     dbg.log_reduce_scatter(None, output_lst, sub_group_id="flat_output")
 
-    rs_nbytes = tensor_partition_flat_buffer.numel() * tensor_partition_flat_buffer.element_size()
     return _DeferredRsResult(rs_handle, output_flat, output_lst,
-                             t_rs_start, t_rs_enqueued, rs_nbytes)
+                             submit_fn=submit_fn, src_ready_ev=src_ready_ev)
 
-
-# ============ ここから CPU オフロード関連 ============
 
 def _adam_worker(pipe, fp32_weights, grad_bufs, optimizer_defaults,
                  sub_group_to_group_id, num_subgroups):
@@ -521,6 +344,12 @@ class ZeroOptimizer3(object):
         
         self.device = torch.cuda.current_device() if not self.offload_optimizer else "cpu" #self.deviceがZeRO Offloadの時はCPUになる
         self.__reduce_and_partition_stream = Stream() if overlap_comm else torch.cuda.current_stream()
+
+        # 遅延 submit 中の RS を AG enqueue 前に強制 submit するフックを登録。
+        # これが無いと RS の submit 位置が GPU タイミング依存になり、rank 間で
+        # collective の発行順序がズレて DPU ring が噛み合わない (RING_RECV Bad State)。
+        import partition_parameters as _pp
+        _pp.register_pre_enqueue_hook(self._force_submit_pending_rs)
         self.local_device = torch.device("cuda") #現在のGPU
         
         self.timers = timers
@@ -553,7 +382,8 @@ class ZeroOptimizer3(object):
         self._adam_thread = None   # DISABLE_ADAM_FORK=1 時の threading 経路用
         self._adam_step_pending = False
         
-        self.next_swappable_fp32_partitioned_groups = [] #FP32 パーティションのスワップ候補キュー (未使用)
+        #この変数いらないかも
+        self.next_swappable_fp32_partitioned_groups = [] #FP32 パーティションの スワップ（入れ替え/オフロード）候補キュー。I/O と計算を重ねるための先読み・交換管理
 
         self.partition_size = [] #各パーティションの大きさ
         self.all_reduce_print = False
@@ -609,8 +439,15 @@ class ZeroOptimizer3(object):
             force=False)
         
         self._setup_for_real_optimizer()
-
-        # grad_position[param_id] = [group_id, current_offset, num_elements]
+        
+        '''
+        self.grad_position[param_id] = [
+            int(group_id),
+            int(current_offset),
+            int(num_elements)
+        ]
+        何番目のパラメータが、どのsub_groupに属していて、sub_group上ではcurrent_offsetから始まり、num_elemnts個の要素を持っている
+        '''
         self.grad_position = {}
         self.set_grad_positions() #上記の変数について全パラメータ分を一気に登録
         
@@ -652,7 +489,8 @@ class ZeroOptimizer3(object):
         return self.parameter_offload.get_param_coordinator(training)
     
         
-    #小テンソル群を CPU 経由で 1 本の連続バッファに詰め直してメモリ断片化を解消する
+    #多数の小さな GPU テンソル(tensor)を一度 CPU に集めて 1 本の大きな連続バッファにまとめ直し、再び GPU に戻すことで、メモリ断片化を解消する
+    #get_only_unique_item(list): listの要素がすべて同じときのみその要素を返す, 2つ以上あったらraise Error
     @staticmethod
     def defragment(tensors: List[Tensor]) -> Tensor:
         cpu_buffer = torch.empty(sum(p.numel() for p in tensors), dtype=get_only_unique_item(t.dtype for t in tensors), device="cpu") #CPU上のバッファに連続領域を取る
@@ -676,7 +514,8 @@ class ZeroOptimizer3(object):
             tensor.data = device_buffer.narrow(0, offset, tensor_numel) #GPU上に移した連続領域を参照できるようにする
         return device_buffer #GPU上連続領域
             
-    #param_group を要素数合計が sub_group_size に達するごとに束ねてサブグループに分割
+    #1つの param_group を「要素数（partition_numel）の合計が一定しきい値（sub_group_size）に達するまで」順に束ねて、小分けのサブグループ配列に分割す
+    #ZeRO-3 の後続処理（フラット化・通信・オフロード・プリフェッチ）の処理単位を制御してメモリ/帯域を安定化
     def _create_fp16_sub_groups(self, params_group):
         params_group_numel = sum([param.partition_numel() for param in params_group])
         sub_group_size = self.sub_group_size
@@ -697,7 +536,8 @@ class ZeroOptimizer3(object):
                 
         return sub_groups
     
-    #各パラメータを 1 本のフラットバッファへ詰め直し、param.ds_tensor をその領域に付け替える
+    #(可能なら)各パラメータを1本のフラットCPUバッファへ順番に詰めなおし、元のparam.ds_tensorがそのフラット領域をさすように付け替える関数
+    #self._move_to_flat_buffer(sub_group, fp16_partitioned_group_flat, avoid_copy=not self.offload_param)
     def _move_to_flat_buffer(self, param_list, flat_buffer, avoid_copy=False):
         if flat_buffer is None:
             return
@@ -715,6 +555,8 @@ class ZeroOptimizer3(object):
         for j, param_group in enumerate(self.optimizer.param_groups):
             params_in_group = sum([p.partition_numel() for p in param_group['params']]) #1列のバッファにするために要素数だけのサイズのバッファを取る
             flat_buffer_size = params_in_group
+            #CPUに入るまでのデータはぎりぎりまでflat_buffer_sizeにつめる
+            #そうでないデータはまだ処理しない(この関数ではCPUに連続バッファ領域を取るためだけの関数)
             aggregate_param_count += params_in_group
             if flat_buffer_size > 0:
                 print_rank_0(f"group {j} flat buffer size {flat_buffer_size}", force=False)
@@ -825,7 +667,11 @@ class ZeroOptimizer3(object):
 
         return
 
-    #fp32 パーティション作成・optimizer state 初期化・勾配バッファ割り当てをまとめて行う土台作り
+    '''
+    実際にOptimizerを構築する前段階の「土台作り」をまとめて行う関数
+    言い換えるとfp32パラメータのパーティション、オプティマイザ状態の初期化、勾配バッファの割り当て
+    といった「ZeRO冗長化」+ オフロード前提の学習環境を作る
+    '''
     def _setup_for_real_optimizer(self):
         see_memory_usage("Before creating fp32 partitions", force=False)
         self._create_fp32_partitions() #fp32マスターコピーを使うためのfp32パラメータパーティション作成
@@ -867,6 +713,7 @@ class ZeroOptimizer3(object):
                     int(current_offset),
                     int(num_elements)
                 ]
+                #print(f"param id {param_id} i:{i}, ds_tensor {num_elements} numel {param.numel()}")
                 current_offset += num_elements
         see_memory_usage(f"After Set Grad positions", force=False)
     
@@ -970,16 +817,8 @@ class ZeroOptimizer3(object):
                 grad_partitions = prev_deferred.wait()
                 if prev_deferred._needs_dtype_convert:
                     grad_partitions = [g.to(prev_deferred._target_dtype) for g in grad_partitions]
-                _rs_nccl = os.environ.get("RS_USE_NCCL", "0") == "1"
-                if _rs_nccl:
-                    d2h_start = torch.cuda.Event(enable_timing=True)
-                    d2h_end = torch.cuda.Event(enable_timing=True)
-                    d2h_start.record()
+                # D2H (grad GPU->CPU) は nsys の memcpy トレースで観測する。
                 self.__partition_grads(prev_params, grad_partitions)
-                if _rs_nccl:
-                    d2h_end.record()
-                    d2h_end.synchronize()
-                    _accumulate_grad_offload_d2h_time_ms(d2h_start.elapsed_time(d2h_end))
                 event = Event()
                 event.record()
                 self.__param_reduce_events.append(event)
@@ -993,15 +832,31 @@ class ZeroOptimizer3(object):
         self._pending_rs = (deferred, list(self.__params_in_ipg_bucket))
         self.__params_in_ipg_bucket.clear()
 
-    @instrument_w_nvtx
+    @instrument_w_nvtx #NVTX の範囲計測用デコレータ。プロファイラでこの関数の実行区間を可視化します。
     @torch.no_grad()
+    def _force_submit_pending_rs(self) -> None:
+        """保留中の deferred RS を (src ready を待ってでも) 必ず submit する。
+        partition_parameters の AG enqueue 直前フックから呼ばれる。"""
+        pending = getattr(self, '_pending_rs', None)
+        if pending is not None:
+            pending[0].force_submit()
+
     def __add_grad_to_ipg_bucket(self, param: Parameter) -> None: #このparamはフルサイズの勾配
-        #計算 (default stream) で勾配ができてから詰めるよう、通信・分割用ストリームに依存関係を張る
-        self.__reduce_and_partition_stream.wait_stream(torch.cuda.default_stream())
+        # 保留中の deferred RS があれば、src ready (CUDA event) を非ブロッキングで
+        # 確認してその場で DPU へ submit する (bwd 中に param 毎に呼ばれるため、
+        # cat/div_ 完了のサブms後には submit される)
+        if getattr(self, '_pending_rs', None) is not None:
+            self._pending_rs[0].maybe_submit()
+
+        #wait_stream(A) を B ストリームの文脈で呼ぶと、
+        #A 上の「それ以前に発行された全ての作業が完了したこと」を示すイベントを記録し、
+        #B にそのイベントを待たせるので、B の以降の仕事は A の以前の仕事の完了後にだけ進むようになります。
+        self.__reduce_and_partition_stream.wait_stream(torch.cuda.default_stream()) #通信・分割用ストリームが、**デフォルトストリーム（計算）**の処理完了を待つよう依存関係を張る。計算が終わって勾配が出来てから詰めるため。
 
         if self.contiguous_gradients and self.elements_in_ipg_bucket + param.grad.numel() < self.reduce_bucket_size:
-            #バケット容量に収まる場合はフラット連結バッファに詰め替える
+            #連結勾配モードかつ、いまのバケット使用量 + この勾配の要素数がバケット容量未満なら、フラット連結バッファに詰め替える。
             with torch.cuda.stream(self.__reduce_and_partition_stream):
+                #view_as(tensor): tensorと同じ形にreshapeするmethod
                 new_grad_tensor = self.__ipg_bucket_flat_buffer.narrow(0, self.elements_in_ipg_bucket, param.grad.numel()).view_as(param.grad)
                 new_grad_tensor.copy_(param.grad, non_blocking=True) #param.gradと同じ内容をコピー
                 #そのテンソルのストレージ(実メモリ)を、指定したstreamが完了するまで解放・再利用させないように記録
@@ -1043,7 +898,9 @@ class ZeroOptimizer3(object):
         return deferred
 
     
-    #RS 済みの勾配パーティションを保持先バッファへコピー/加算し、必要ならオフロードして param.grad を解放
+    #self.__partition_grads(self.__params_in_ipg_bucket, grad_partitions)で呼ばれる(grad_partitions: 自分の担当の集約済み勾配のリスト)
+    #reduce-scatter 済みの 各パラメータ用の勾配パーティション（grad_partitions）を、内部の保持先バッファへ コピー/加算 し、必要なら オフロード、最後に param.grad を解放
+    #self.__partition_grads(self.__params_in_ipg_bucket, grad_partitions)で呼ばれる
     @instrument_w_nvtx
     def __partition_grads(self, params_to_release: List[Parameter], grad_partitions: List[Tensor]) -> None:
         for param, grad_partition in zip(params_to_release, grad_partitions):
@@ -1067,45 +924,51 @@ class ZeroOptimizer3(object):
                       f"same_data_ptr={same_buffer}",
                       flush=True)
 
-            # D2H 転送が必要か判定 (NCCL RS: grad_partition=GPU, grad_buffer=CPU)
-            _is_d2h = (not same_buffer and grad_partition.is_cuda
-                        and not grad_buffer.is_cuda)
-
             if same_buffer:
                 pass  # RS出力が直接grad_bufferに書き込まれている: コピー不要
             elif self.micro_step_id == 0:
                 # D2H の時間は NVTX 区間 'xfer:grad_d2h' の memcpy 射影 (nsys) で取得する。
-                _xfer_push("xfer:grad_d2h")
-                try:
-                    grad_buffer.copy_(grad_partition, non_blocking=True)
-                finally:
-                    _xfer_pop()
+                if self.gradient_accumulation_steps > 1:
+                    # accum あり: この micro_step の勾配を CPU アキュムレータに種として書く
+                    # (次以降の micro_step が add_ で読むため)。
+                    torch.cuda.nvtx.range_push("xfer:grad_d2h")
+                    try:
+                        grad_buffer.copy_(grad_partition, non_blocking=True)
+                    finally:
+                        torch.cuda.nvtx.range_pop()
+                # 下流の fp32 コピーは grad_partition (RS 出力そのもの) から読む (baseline と同じ)。
+                grad_buffer = grad_partition
             else:
                 if grad_buffer.device != grad_partition.device:
                     cuda_grad_buffer = grad_buffer.to(grad_partition.device, non_blocking=True)
                     cuda_grad_buffer.add_(grad_partition)
-                    _xfer_push("xfer:grad_d2h")
+                    torch.cuda.nvtx.range_push("xfer:grad_d2h")
                     try:
                         grad_buffer.copy_(cuda_grad_buffer, non_blocking=True)
                     finally:
-                        _xfer_pop()
+                        torch.cuda.nvtx.range_pop()
                     grad_buffer = cuda_grad_buffer
                 else:
                     grad_buffer.add_(grad_partition)
                 
                 
             if self.offload_optimizer:
-                # i: 所属グループ, dest_offset: フラット勾配バッファ内の書き込み開始オフセット
+                '''
+                いま処理中の param の フラット化された FP32 勾配配列の中での位置情報を取得。
+                i: どの グループ（partitioned group）に属するか
+                dest_offset: そのフラット勾配バッファ内の 書き込み開始オフセット
+                _: 使わない補助情報（長さなどが入っていることが多い）
+                '''
                 i, dest_offset, _ = self.grad_position[self.get_param_id(param)]
                 offload_fp32_gradients = {}
                 offload_fp32_offsets = {}
                 if self.is_gradient_accumulation_boundary:
                     fp32_grad_tensor = self.fp32_grad_bufs[self.grad_buf_switch][i].narrow(0, dest_offset, grad_buffer.numel())
-                    _xfer_push("xfer:grad_d2h")
+                    torch.cuda.nvtx.range_push("xfer:grad_d2h")
                     try:
                         fp32_grad_tensor.copy_(grad_buffer)  # fp16 grad -> fp32 grad buf
                     finally:
-                        _xfer_pop()
+                        torch.cuda.nvtx.range_pop()
                 
             param.grad.record_stream(torch.cuda.current_stream())
             param.grad = None
@@ -1128,16 +991,8 @@ class ZeroOptimizer3(object):
                 grad_partitions = prev_deferred.wait()
                 if prev_deferred._needs_dtype_convert:
                     grad_partitions = [g.to(prev_deferred._target_dtype) for g in grad_partitions]
-                _rs_nccl = os.environ.get("RS_USE_NCCL", "0") == "1"
-                if _rs_nccl:
-                    d2h_start = torch.cuda.Event(enable_timing=True)
-                    d2h_end = torch.cuda.Event(enable_timing=True)
-                    d2h_start.record()
+                # D2H (grad GPU->CPU) は nsys の memcpy トレースで観測する。
                 self.__partition_grads(prev_params, grad_partitions)
-                if _rs_nccl:
-                    d2h_end.record()
-                    d2h_end.synchronize()
-                    _accumulate_grad_offload_d2h_time_ms(d2h_start.elapsed_time(d2h_end))
                 event = Event()
                 event.record()
                 self.__param_reduce_events.append(event)
@@ -1174,16 +1029,19 @@ class ZeroOptimizer3(object):
                     if p.grad is not None:
                         p.grad.detach_()
                         p.grad.zero_()
-    
+        
     @instrument_w_nvtx
     def _prepare_sub_group(self, sub_group_id, timer_names=set()):
         see_memory_usage(f'Before prepare optimizer sub group {sub_group_id}', force=False)
-
+        
         #CPUでoptimizer更新を行うときはすでにfp32側に入っているはずなので前処理はいらない
 
         see_memory_usage(f'After prepare optimizer sub group {sub_group_id}', force=False)
-
-    #フラットバッファ上の各スライスを個々の Parameter shard の .data に張り直す
+        
+    '''
+    self._unflatten_partitioned_parameters(sub_group_id) で、フラットバッファ上の各スライスを個々の Parameter shard の .data に再び張り直す（ビュー/コピー）処理を行います。
+    これにより モデルパラメータ（分割 shard）が最新の値を指し、次イテレーションの forward/backward で使える状態になります。
+    '''
     def _unflatten_partitioned_parameters(self, sub_group_id):
         updated_params = self.unflatten(self.fp16_partitioned_groups_flat[sub_group_id],
                                         self.fp16_partitioned_groups[sub_group_id])
@@ -1202,53 +1060,49 @@ class ZeroOptimizer3(object):
     def _release_sub_group(self, sub_group_id, timer_names=set()):
         
         see_memory_usage(f'Before release optimizer sub group {sub_group_id}', force=False)
+        # get rid of the fp32 gradients. Not needed anymore
         #CPUにfp32 gradientが常駐しているのでNoneにして消さなくてもいい
+        #self.fp32_partitioned_groups_flat[sub_group_id].grad = None
 
         see_memory_usage(f'After release optimizer sub group {sub_group_id}', force=False)
-
+        
     @instrument_w_nvtx
     def _post_step(self, timer_names=set()):
-        if self.offload_optimizer:
+        if self.offload_optimizer: #Offloadしないから今は無視
+            #self.reset_cpu_buffers() #overflowなどのリセットだったので無視する
             pass
-
+            
+        #self.log_timers(timer_names)
         see_memory_usage('After zero_optimizer step', force=False)
         print_rank_0(f"------------------Finishing Step-----------------------")
         
     @instrument_w_nvtx
     def step(self, closure=None):
-        self._flush_pending_rs()  # optimizer step 前に全 RS 完了を保証
+        """通常経路 (非 DPU): backward が書いた勾配バッファで CPU Adam を同期実行し、
+        同一 step 内で fp32 → fp16 への反映まで行う。"""
         self._pre_step()
         self._partition_all_parameters()
 
         timer_names = set()
-
         from common import debug_params as dbg
-
-        #update parameters one sub group at a time
         for sub_group_id, group in enumerate(self.fp16_groups):
-
-            #prepare optimizer states, gradients and fp32 parameters for update
-            self._prepare_sub_group(sub_group_id, timer_names) #fp32マスタコピーの登録
-
             dbg.log_param_update("BEFORE_STEP", sub_group_id, self.fp32_partitioned_groups_flat[sub_group_id])
 
-            #apply the optimizer step on the sub group and copy fp32 parameters to fp16
-            self._optimizer_step(sub_group_id) #sub_groupに対応するfp32マスタコピーを登録してそのままoptimizer.step()を行う
+        # backward が書き込んだ側の勾配バッファ (grad_buf_switch) で step し、完了を待つ
+        self._adam_pipe_parent.send(("step", self.grad_buf_switch))
+        result = self._adam_pipe_parent.recv()
+        assert result == "done", f"unexpected message from adam worker: {result}"
 
+        for sub_group_id, group in enumerate(self.fp16_groups):
+            self._prepare_sub_group(sub_group_id, timer_names)
             dbg.log_param_update("AFTER_STEP", sub_group_id, self.fp32_partitioned_groups_flat[sub_group_id])
-
-            #put fp16 parameters in appropriate location
-            self._reassign_or_swap_out_partitioned_parameters(sub_group_id) #fp32 -> fp16へと重みパラメータを反映させる
-
+            self._reassign_or_swap_out_partitioned_parameters(sub_group_id)
             dbg.log_param_update("AFTER_COPY", sub_group_id,
                                  self.fp32_partitioned_groups_flat[sub_group_id],
                                  self.fp16_partitioned_groups_flat[sub_group_id])
-
-            #release memory or swap out optimizer states of fp32 parameters
-            self._release_sub_group(sub_group_id, timer_names) #fp32マスタコピーについての勾配を解放
+            self._release_sub_group(sub_group_id, timer_names)
 
         self._post_step(timer_names)
-
 
     '''Delayed Parameter Update周りの関数 (CPU Adam は child process で実行)'''
 

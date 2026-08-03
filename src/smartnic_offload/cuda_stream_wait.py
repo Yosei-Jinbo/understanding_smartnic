@@ -1,8 +1,12 @@
 """cuStreamWaitValue32 wrapper for PyTorch CUDA streams.
 
-DPU が GPU メモリ上の int32 フラグに値を書き、compute stream は HW semaphore で
-その値を待つ (Python thread はブロックしない)。
-CU_STREAM_WAIT_VALUE_FLUSH は A4000 (CAN_FLUSH_REMOTE_WRITES=0) では使えない。
+DPU が AG 完了時に GPU メモリ上の int32 フラグに値を書き込み、PyTorch の compute
+stream はその値を待ってから後続の compute kernel を実行する。
+
+これにより:
+  - Python thread は wait() でブロックしなくなる
+  - GPU の HW semaphore で AG completion と compute が同期する
+  - NCCL が CUDA stream で実現しているのと同じ semantics
 """
 
 from __future__ import annotations
